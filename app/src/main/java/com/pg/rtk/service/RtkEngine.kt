@@ -13,11 +13,39 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     companion object {
         // Speed of light in m/s
         private const val SPEED_OF_LIGHT = 299792458.0
-        // Minimum time between UI updates in milliseconds
-        private const val UPDATE_THROTTLE_MS = 200L // 5 Hz max update rate
+
+        /**
+         * Minimum time between UI updates in milliseconds (5 Hz max update rate)
+         *
+         * Rationale for 200ms (5 Hz) throttling:
+         * - GNSS measurements arrive at 1-10 Hz (typically 1 Hz for consumer devices)
+         * - RTK position updates can occur at similar rates
+         * - UI recomposition is expensive on mobile devices
+         * - Human perception doesn't benefit from >5 Hz position updates for navigation
+         * - Balances between responsiveness and battery/CPU efficiency
+         * - Still allows near-real-time tracking for RTK applications
+         *
+         * Higher rates (e.g., 10+ Hz) can be used for specialized applications like
+         * machine control or surveying equipment, but are unnecessary for typical
+         * RTK navigation use cases on mobile devices.
+         */
+        private const val UPDATE_THROTTLE_MS = 200L
+
         // Minimum position change to trigger update (meters)
         private const val MIN_POSITION_CHANGE_M = 0.1
     }
+
+    /**
+     * Data class for returning throttle check results from synchronized block.
+     * Encapsulates all state needed to decide whether to trigger a UI update.
+     */
+    private data class ThrottleCheckResult(
+        val newState: RtkState,
+        val statusChanged: Boolean,
+        val isFirstUpdate: Boolean,
+        val positionChanged: Boolean,
+        val timeSinceLastUpdate: Long
+    )
 
     private var rtcmMessageCount = 0
     private var currentUncorrected = Coordinate()
@@ -153,7 +181,7 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     private fun updateStateThrottled() {
         val currentTime = System.currentTimeMillis()
 
-        val (newState, statusChanged, isFirstUpdate, positionChanged, timeSinceLastUpdate) = synchronized(this) {
+        val checkResult = synchronized(this) {
             val timeSince = currentTime - lastUpdateTime
 
             val state = RtkState(
@@ -170,41 +198,48 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             // Check if position changed significantly
             val posChange = lastState?.let {
                 calculateDistanceFast(it.corrected, state.corrected) >= MIN_POSITION_CHANGE_M
-            } ?: true
+            } != false
 
-            Tuple5(state, statusChange, firstUpdate, posChange, timeSince)
+            ThrottleCheckResult(
+                newState = state,
+                statusChanged = statusChange,
+                isFirstUpdate = firstUpdate,
+                positionChanged = posChange,
+                timeSinceLastUpdate = timeSince
+            )
         }
 
         // Update if: status changed, first update, or (enough time passed AND position changed)
-        if (statusChanged || isFirstUpdate ||
-            (timeSinceLastUpdate >= UPDATE_THROTTLE_MS && positionChanged)) {
-            onRtkStatusUpdate(newState)
+        if (checkResult.statusChanged || checkResult.isFirstUpdate ||
+            (checkResult.timeSinceLastUpdate >= UPDATE_THROTTLE_MS && checkResult.positionChanged)) {
+            onRtkStatusUpdate(checkResult.newState)
             synchronized(this) {
                 lastUpdateTime = currentTime
-                lastState = newState
+                lastState = checkResult.newState
             }
         }
     }
 
-    // Helper data class for returning multiple values from synchronized block
-    private data class Tuple5<A, B, C, D, E>(
-        val first: A,
-        val second: B,
-        val third: C,
-        val fourth: D,
-        val fifth: E
-    )
-
+    /**
+     * Reset the RTK engine state and reinitialize the native library.
+     *
+     * Thread-safe: The entire reset operation is synchronized to prevent race conditions
+     * with concurrent GNSS measurement or RTCM data processing.
+     */
     fun reset() {
         synchronized(this) {
+            // Clear all state variables
             rtcmMessageCount = 0
             status = RtkStatus.SINGLE
             lastUpdateTime = 0L
             lastState = null
-        }
-        RtkLibNative.initRtkEngine()
-        // Force immediate update after reset
-        synchronized(this) {
+
+            // Reinitialize native engine while holding lock
+            // This prevents processRawGnssData/processRtcmData from reading
+            // cleared state before initialization completes
+            RtkLibNative.initRtkEngine()
+
+            // Force immediate update after reset
             onRtkStatusUpdate(RtkState(
                 uncorrected = currentUncorrected,
                 corrected = currentCorrected,

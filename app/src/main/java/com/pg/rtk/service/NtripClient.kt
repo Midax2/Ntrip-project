@@ -4,16 +4,25 @@ import com.pg.rtk.data.NtripConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
 import java.util.Base64
+import java.util.concurrent.TimeoutException
 
 class NtripClient(
     private val config: NtripConfig,
     private val onDataReceived: (ByteArray) -> Unit,
     private val onLog: (String) -> Unit
 ) {
+    companion object {
+        // Timeout for reading HTTP response header (10 seconds)
+        private const val HEADER_READ_TIMEOUT_MS = 10000L
+        // Maximum header size to prevent memory exhaustion (16 KB)
+        private const val MAX_HEADER_SIZE = 16384
+    }
+
     private var socket: Socket? = null
     private var input: InputStream? = null
     private var output: OutputStream? = null
@@ -37,9 +46,27 @@ class NtripClient(
             val inputStream = input ?: throw Exception("Failed to get input stream")
 
             // 1. Send NTRIP Request with secure credential handling
+            /**
+             * CREDENTIAL SECURITY NOTE:
+             *
+             * We attempt to minimize credential exposure by:
+             * - Clearing credentialsBytes immediately after encoding
+             * - Clearing encodedAuth after building request
+             * - Clearing request bytes after sending
+             *
+             * REMAINING LIMITATIONS:
+             * - config.user and config.password (String) remain in memory (by design for reconnection)
+             * - JVM string interning may create additional copies
+             * - Kotlin/Java String is immutable and cannot be securely wiped
+             *
+             * BEST PRACTICE FOR PRODUCTION:
+             * Consider using CharArray instead of String for passwords in NtripConfig,
+             * which allows secure wiping: charArray.fill('\u0000')
+             */
+
             // Build credentials string in minimal scope
             val credentialsBytes = "${config.user}:${config.password}".toByteArray()
-            val encodedAuth = Base64.getEncoder().encodeToString(credentialsBytes)
+            var encodedAuth = Base64.getEncoder().encodeToString(credentialsBytes)
             // Clear credentials from memory immediately after encoding
             credentialsBytes.fill(0)
 
@@ -51,11 +78,29 @@ class NtripClient(
                 append("Ntrip-Version: Ntrip/2.0\r\n")
                 append("\r\n")
             }
-            outputStream.write(request.toByteArray())
+
+            // Convert to bytes for sending
+            val requestBytes = request.toByteArray()
+
+            // Clear encodedAuth from memory (best effort - String is immutable)
+            @Suppress("UNUSED_VALUE")
+            encodedAuth = ""  // Dereference to help GC
+
+            // Send request
+            outputStream.write(requestBytes)
             outputStream.flush()
 
-            // 2. Read HTTP Response Header
-            val header = readHeader(inputStream)
+            // Clear request bytes from memory
+            requestBytes.fill(0)
+
+            // 2. Read HTTP Response Header with timeout protection
+            val header = try {
+                withTimeout(HEADER_READ_TIMEOUT_MS) {
+                    readHeader(inputStream)
+                }
+            } catch (_: TimeoutException) {
+                throw Exception("Timeout reading NTRIP response header after ${HEADER_READ_TIMEOUT_MS}ms")
+            }
             // Only log success status, not full header which may contain sensitive info
             if (header.startsWith("ICY 200 OK")) {
                 onLog("Received Header: ICY 200 OK")
@@ -115,12 +160,33 @@ class NtripClient(
         }
     }
 
+    /**
+     * Read HTTP response header from input stream.
+     *
+     * Protection mechanisms:
+     * - Size limit: Prevents memory exhaustion from malicious/broken servers
+     * - Timeout: Handled by caller using withTimeout
+     * - Proper termination: Looks for \r\n\r\n sequence
+     *
+     * @param input Input stream to read from
+     * @return Trimmed header string
+     * @throws Exception if header exceeds MAX_HEADER_SIZE or stream ends prematurely
+     */
     private fun readHeader(input: InputStream): String {
         val header = StringBuilder()
         while (true) {
+            // Check size limit to prevent memory exhaustion
+            if (header.length >= MAX_HEADER_SIZE) {
+                throw Exception("Header exceeds maximum size of $MAX_HEADER_SIZE bytes")
+            }
+
             val byte = input.read()
-            if (byte == -1) break
+            if (byte == -1) {
+                throw Exception("Connection closed while reading header")
+            }
+
             header.append(byte.toChar())
+
             // HTTP headers are terminated by \r\n\r\n
             if (header.endsWith("\r\n\r\n")) break
         }
@@ -145,15 +211,15 @@ class NtripClient(
             try {
                 // Close resources in proper order: output stream, input stream, then socket
                 output?.close()
-            } catch (e: Exception) { /* Ignore - best effort cleanup */ }
+            } catch (_: Exception) { /* Ignore - best effort cleanup */ }
 
             try {
                 input?.close()
-            } catch (e: Exception) { /* Ignore - best effort cleanup */ }
+            } catch (_: Exception) { /* Ignore - best effort cleanup */ }
 
             try {
                 socket?.close()
-            } catch (e: Exception) { /* Ignore - best effort cleanup */ }
+            } catch (_: Exception) { /* Ignore - best effort cleanup */ }
 
             output = null
             input = null

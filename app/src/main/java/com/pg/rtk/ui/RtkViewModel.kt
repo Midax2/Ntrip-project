@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class RtkViewModel(
     locationManager: LocationManager
@@ -31,9 +33,11 @@ class RtkViewModel(
     private val _ntripConfig = MutableStateFlow(NtripConfig())
     val ntripConfig: StateFlow<NtripConfig> = _ntripConfig
 
-    @Volatile
+    // Mutex to protect NTRIP connection/disconnection operations
+    private val ntripMutex = Mutex()
+
+    // Note: @Volatile removed - access now protected by mutex
     private var ntripClient: NtripClient? = null
-    @Volatile
     private var ntripJob: Job? = null
     private var isGnssListening = false
 
@@ -96,7 +100,9 @@ class RtkViewModel(
      * configuration and starts streaming RTCM correction data to the RTK engine.
      *
      * **Threading:** This method is safe to call from any thread. The actual network
-     * connection is established on the IO dispatcher (background thread).
+     * connection is established on the IO dispatcher (background thread). The entire
+     * connect operation is protected by a mutex to prevent race conditions with
+     * concurrent connect/disconnect calls.
      *
      * **Behavior:**
      * - Cancels any existing connection attempt before starting a new one
@@ -109,30 +115,43 @@ class RtkViewModel(
      * Check the log field for connection failure details.
      *
      * **Safe to call multiple times:** Calling this method while a connection is active
-     * will cancel the existing connection and start a new one.
+     * will cancel the existing connection and start a new one. Concurrent calls are
+     * serialized by a mutex.
      *
      * @see disconnectNtrip
      * @see updateConfig
      */
     fun connectNtrip() {
-        ntripJob?.cancel()
-        _rtkState.update { it.copy(status = RtkStatus.CONNECTING_NTRIP, ntripLog = "") }
-        rtkEngine.reset() // Reset engine state upon new connection attempt
+        viewModelScope.launch {
+            ntripMutex.withLock {
+                // Cancel any existing connection
+                ntripJob?.cancel()
+                ntripJob = null
+                ntripClient?.disconnect()
+                ntripClient = null
 
-        val client = NtripClient(
-            config = _ntripConfig.value,
-            onDataReceived = rtkEngine::processRtcmData, // Feed RTCM data to the engine
-            onLog = { log ->
-                _rtkState.update { it.copy(ntripLog = log) }
-                if (log.startsWith("Received Header: ICY 200 OK")) {
-                    _rtkState.update { it.copy(status = RtkStatus.RECEIVING_RTCM) }
+                // Update state to connecting
+                _rtkState.update { it.copy(status = RtkStatus.CONNECTING_NTRIP, ntripLog = "") }
+                rtkEngine.reset() // Reset engine state upon new connection attempt
+
+                // Create new client
+                val client = NtripClient(
+                    config = _ntripConfig.value,
+                    onDataReceived = rtkEngine::processRtcmData, // Feed RTCM data to the engine
+                    onLog = { log ->
+                        _rtkState.update { it.copy(ntripLog = log) }
+                        if (log.startsWith("Received Header: ICY 200 OK")) {
+                            _rtkState.update { it.copy(status = RtkStatus.RECEIVING_RTCM) }
+                        }
+                    }
+                )
+                ntripClient = client
+
+                // Launch connection job
+                ntripJob = viewModelScope.launch(Dispatchers.IO) {
+                    client.connect()
                 }
             }
-        )
-        ntripClient = client
-
-        ntripJob = viewModelScope.launch(Dispatchers.IO) {
-            client.connect()
         }
     }
 
@@ -142,9 +161,9 @@ class RtkViewModel(
      * This method cleanly terminates the connection to the NTRIP caster and stops
      * all RTCM data streaming.
      *
-     * **Threading:** This method is safe to call from any thread. The cancellation
-     * is handled by the coroutine system and the socket is closed on whatever thread
-     * it was running on.
+     * **Threading:** This method is safe to call from any thread. The entire
+     * disconnect operation is protected by a mutex to prevent race conditions with
+     * concurrent connect/disconnect calls.
      *
      * **Behavior:**
      * - Cancels the background connection coroutine (if running)
@@ -153,7 +172,8 @@ class RtkViewModel(
      * - Updates log to indicate disconnection
      *
      * **Safe to call multiple times:** Calling this method when not connected
-     * is safe and has no side effects (beyond updating the status).
+     * is safe and has no side effects (beyond updating the status). Concurrent
+     * calls are serialized by a mutex.
      *
      * **Note:** This does NOT stop GNSS listening or reset the RTK engine.
      * It only disconnects from the NTRIP correction data source.
@@ -162,9 +182,20 @@ class RtkViewModel(
      * @see stopGnssListening
      */
     fun disconnectNtrip() {
-        ntripJob?.cancel()
-        ntripClient?.disconnect()
-        _rtkState.update { it.copy(status = RtkStatus.DISCONNECTED, ntripLog = "NTRIP Disconnected.") }
+        viewModelScope.launch {
+            ntripMutex.withLock {
+                // Cancel connection job
+                ntripJob?.cancel()
+                ntripJob = null
+
+                // Disconnect client
+                ntripClient?.disconnect()
+                ntripClient = null
+
+                // Update state
+                _rtkState.update { it.copy(status = RtkStatus.DISCONNECTED, ntripLog = "NTRIP Disconnected.") }
+            }
+        }
     }
 
     override fun onCleared() {
