@@ -11,8 +11,6 @@ import kotlin.math.sqrt
 class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
     companion object {
-        // Speed of light in m/s
-        private const val SPEED_OF_LIGHT = 299792458.0
 
         /**
          * Minimum time between UI updates in milliseconds (5 Hz max update rate)
@@ -60,19 +58,83 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
     /**
      * Calculate pseudorange from GNSS timing measurements
-     * Pseudorange = (received time - transmit time) * speed of light
+     * Based on Google's GnssLogger implementation
+     * Reference: https://github.com/google/gps-measurement-tools
      */
-    private fun calculatePseudorange(measurement: GnssMeasurement, receiverTimeNanos: Long): Double {
-        val tRxNanos = receiverTimeNanos
+    private fun calculatePseudorange(measurement: GnssMeasurement, clock: android.location.GnssClock): Double {
+        // Check required fields
+        if (!clock.hasFullBiasNanos() || !clock.hasBiasNanos()) {
+            return 0.0
+        }
+
+        // Check measurement state - need at least code lock
+        val state = measurement.state
+        if ((state and GnssMeasurement.STATE_CODE_LOCK) == 0) {
+            // No code lock, measurement not valid
+            return 0.0
+        }
+
+        // Check if received SV time looks valid (should be time of week in nanoseconds)
         val tTxNanos = measurement.receivedSvTimeNanos
+        if (tTxNanos <= 0 || tTxNanos > 604800000000000L) {
+            // Invalid satellite time (outside of GPS week range)
+            return 0.0
+        }
+
+        // Receiver time in nanoseconds (hardware clock)
+        val tRxNanos = clock.timeNanos
+
+        // Full bias to convert to GPS time (includes week number)
+        val fullBiasNanos = clock.fullBiasNanos
+
+        // Additional bias (sub-millisecond corrections)
+        val biasNanos = if (clock.hasBiasNanos()) clock.biasNanos else 0.0
+
+        // Time offset (measurement-specific)
         val timeOffsetNanos = measurement.timeOffsetNanos
 
-        // Calculate time difference in nanoseconds and convert to meters
-        val travelTimeNanos = tRxNanos - tTxNanos - timeOffsetNanos
-        return travelTimeNanos * SPEED_OF_LIGHT / 1e9
+
+        // Receiver time in GPS time scale (nanoseconds since GPS epoch: Jan 6, 1980)
+        val tRxGpsNanos = tRxNanos - fullBiasNanos - biasNanos - timeOffsetNanos
+
+        // GPS week in nanoseconds
+        val weekNanos = 604800000000000L  // 7 days in nanoseconds
+
+        // Get receiver's GPS week and time within week
+        val rxWeekNumber = tRxGpsNanos / weekNanos
+
+        // Satellite transmission time is time-of-week, convert to full GPS time
+        val tTxGpsNanos = rxWeekNumber * weekNanos + tTxNanos
+
+        // Calculate time of flight
+        var travelTimeNanos = tRxGpsNanos - tTxGpsNanos
+
+        // Handle week rollover
+        if (travelTimeNanos > weekNanos / 2) {
+            travelTimeNanos -= weekNanos
+        } else if (travelTimeNanos < -weekNanos / 2) {
+            travelTimeNanos += weekNanos
+        }
+
+        // Convert to meters (speed of light)
+        val pseudorange = travelTimeNanos * 2.99792458e8 * 1e-9
+
+        // Sanity check: satellites at ~20,000-26,000 km
+        // Valid pseudorange: 19M to 30M meters (0.063 to 0.100 light-seconds)
+        if (pseudorange < 1.9e7 || pseudorange > 3.0e7) {
+            return 0.0
+        }
+
+        android.util.Log.d("RtkEngine", "Valid PR for SVID ${measurement.svid}: $pseudorange m (state=0x${state.toString(16)})")
+        return pseudorange
     }
 
     fun processRawGnssData(event: GnssMeasurementsEvent) {
+        // Log clock information for debugging
+        android.util.Log.d("RtkEngine", "Clock: timeNanos=${event.clock.timeNanos}, " +
+                "fullBiasNanos=${if (event.clock.hasFullBiasNanos()) event.clock.fullBiasNanos else "N/A"}, " +
+                "biasNanos=${if (event.clock.hasBiasNanos()) event.clock.biasNanos else "N/A"}")
+
         val measurements = event.measurements.filter {
             it.hasCarrierFrequencyHz() &&
                     it.state and GnssMeasurement.STATE_CODE_LOCK != 0 &&
@@ -81,10 +143,17 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
         if (measurements.isEmpty()) return
 
+        // Log first measurement details
+        val m = measurements[0]
+        android.util.Log.d("RtkEngine", "First measurement: svid=${m.svid}, " +
+                "receivedSvTimeNanos=${m.receivedSvTimeNanos}, " +
+                "timeOffsetNanos=${m.timeOffsetNanos}, " +
+                "cn0=${m.cn0DbHz}")
+
         val svids = IntArray(measurements.size) { measurements[it].svid }
         val constellations = IntArray(measurements.size) { measurements[it].constellationType }
         val pseudoranges = DoubleArray(measurements.size) {
-            calculatePseudorange(measurements[it], event.clock.timeNanos)
+            calculatePseudorange(measurements[it], event.clock)
         }
         val carrierPhases = DoubleArray(measurements.size) {
             // Check if carrier phase is available via state flags instead of deprecated hasCarrierPhase()
@@ -145,11 +214,20 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     }
 
     private fun updateStatusFromSolution(statusCode: Int) {
-        status = when (statusCode) {
+        val newStatus = when (statusCode) {
             5 -> RtkStatus.FIX
             4 -> RtkStatus.FLOAT
             2 -> RtkStatus.RECEIVING_RTCM
             else -> RtkStatus.SINGLE
+        }
+
+        // Don't downgrade from RECEIVING_RTCM to SINGLE if we're actually receiving RTCM data
+        // Only upgrade status or stay at RECEIVING_RTCM if we have RTCM messages
+        status = when {
+            newStatus == RtkStatus.FIX || newStatus == RtkStatus.FLOAT -> newStatus
+            rtcmMessageCount > 0 && status == RtkStatus.SINGLE -> RtkStatus.RECEIVING_RTCM
+            rtcmMessageCount > 0 && newStatus == RtkStatus.SINGLE -> RtkStatus.RECEIVING_RTCM
+            else -> newStatus
         }
     }
 

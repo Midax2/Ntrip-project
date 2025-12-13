@@ -30,3 +30,25 @@ data class NtripConfig(
     val user: String = "",
     val password: String = ""
 )
+
+data class RawDataState(
+    val isReceivingData: Boolean = false,
+    val totalEventsReceived: Int = 0,
+    val satelliteCount: Int = 0,
+    val lastUpdateTime: String = "Never",
+    val clockTimeNanos: Long = 0,
+    val gpsCount: Int = 0,
+    val glonassCount: Int = 0,
+    val galileoCount: Int = 0,
+    val beidouCount: Int = 0,
+    val otherCount: Int = 0,
+    val lastMeasurementDetails: String = ""
+)
+
+data class NtripStatusState(
+    val bytesReceived: Long = 0,
+    val connectionDuration: String = "00:00:00",
+    val dataRate: Double = 0.0,
+    val rtcmMessageTypes: Map<Int, Int> = emptyMap(),
+    val lastRtcmData: String = ""
+)
