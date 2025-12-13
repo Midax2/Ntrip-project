@@ -3,6 +3,7 @@ package com.pg.rtk.service
 import android.location.GnssMeasurementsEvent
 import android.location.GnssMeasurement
 import com.pg.rtk.data.Coordinate
+import com.pg.rtk.data.GnssConstants
 import com.pg.rtk.data.RtkState
 import com.pg.rtk.data.RtkStatus
 import kotlin.math.cos
@@ -74,17 +75,18 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             return 0.0
         }
 
-        // Check if received SV time looks valid (should be time of week in nanoseconds)
+        // Basic sanity check on raw received SV time (must be positive)
+        // We intentionally DO NOT enforce an upper bound here, because the
+        // interpretation of receivedSvTimeNanos as time-of-week is handled
+        // later when we combine it with the receiver's GPS week. A value
+        // near the end of the week (close to GPS_WEEK_NANOS) is still valid.
         val tTxNanos = measurement.receivedSvTimeNanos
-        if (tTxNanos <= 0 || tTxNanos > 604800000000000L) {
-            // Invalid satellite time (outside of GPS week range)
+        if (tTxNanos <= 0L) {
             return 0.0
         }
 
-        // Receiver time in nanoseconds (hardware clock)
         val tRxNanos = clock.timeNanos
 
-        // Full bias to convert to GPS time (includes week number)
         val fullBiasNanos = clock.fullBiasNanos
 
         // Additional bias (sub-millisecond corrections)
@@ -97,35 +99,39 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
         // Receiver time in GPS time scale (nanoseconds since GPS epoch: Jan 6, 1980)
         val tRxGpsNanos = tRxNanos - fullBiasNanos - biasNanos - timeOffsetNanos
 
-        // GPS week in nanoseconds
-        val weekNanos = 604800000000000L  // 7 days in nanoseconds
-
         // Get receiver's GPS week and time within week
-        val rxWeekNumber = tRxGpsNanos / weekNanos
+        val rxWeekNumber = tRxGpsNanos / GnssConstants.GPS_WEEK_NANOS
+        val rxTimeInWeek = tRxGpsNanos % GnssConstants.GPS_WEEK_NANOS // kept for clarity / potential future use
 
-        // Satellite transmission time is time-of-week, convert to full GPS time
-        val tTxGpsNanos = rxWeekNumber * weekNanos + tTxNanos
+        // Satellite transmission time is time-of-week; convert to full GPS time
+        val tTxGpsNanos = rxWeekNumber * GnssConstants.GPS_WEEK_NANOS + tTxNanos
 
         // Calculate time of flight
         var travelTimeNanos = tRxGpsNanos - tTxGpsNanos
 
-        // Handle week rollover
-        if (travelTimeNanos > weekNanos / 2) {
-            travelTimeNanos -= weekNanos
-        } else if (travelTimeNanos < -weekNanos / 2) {
-            travelTimeNanos += weekNanos
+        // Handle week rollover: if the computed travel time is more than half a
+        // week off, adjust by ±1 week. This allows tTxNanos values near 0 or
+        // near GPS_WEEK_NANOS to still be valid after wrapping.
+        if (travelTimeNanos > GnssConstants.GPS_WEEK_NANOS / 2) {
+            travelTimeNanos -= GnssConstants.GPS_WEEK_NANOS
+        } else if (travelTimeNanos < -GnssConstants.GPS_WEEK_NANOS / 2) {
+            travelTimeNanos += GnssConstants.GPS_WEEK_NANOS
         }
 
-        // Convert to meters (speed of light)
-        val pseudorange = travelTimeNanos * 2.99792458e8 * 1e-9
+        // Convert to meters using speed of light
+        val pseudorange = travelTimeNanos * GnssConstants.SPEED_OF_LIGHT_M_PER_S * 1e-9
 
-        // Sanity check: satellites at ~20,000-26,000 km
-        // Valid pseudorange: 19M to 30M meters (0.063 to 0.100 light-seconds)
-        if (pseudorange < 1.9e7 || pseudorange > 3.0e7) {
+        // Sanity check: satellites at ~20,000–26,000 km
+        // Valid pseudorange: MIN_PSEUDORANGE_METERS .. MAX_PSEUDORANGE_METERS
+        if (pseudorange < GnssConstants.MIN_PSEUDORANGE_METERS ||
+            pseudorange > GnssConstants.MAX_PSEUDORANGE_METERS) {
             return 0.0
         }
 
-        android.util.Log.d("RtkEngine", "Valid PR for SVID ${measurement.svid}: $pseudorange m (state=0x${state.toString(16)})")
+        android.util.Log.d(
+            "RtkEngine",
+            "Valid PR for SVID ${measurement.svid}: $pseudorange m (state=0x${state.toString(16)})"
+        )
         return pseudorange
     }
 

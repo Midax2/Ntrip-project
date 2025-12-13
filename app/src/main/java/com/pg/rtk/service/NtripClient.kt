@@ -21,6 +21,34 @@ class NtripClient(
         private const val HEADER_READ_TIMEOUT_MS = 10000L
         // Maximum header size to prevent memory exhaustion (16 KB)
         private const val MAX_HEADER_SIZE = 16384
+
+        /**
+         * Size of the buffer for reading NTRIP stream data.
+         *
+         * Set to 4096 bytes (4 KB) to handle:
+         * - RTCM3 messages: typically 100-600 bytes, max ~1023 bytes per message
+         * - HTTP chunked encoding overhead: chunk size line + \r\n markers
+         * - Multiple RTCM messages per read: buffer should accommodate several messages
+         * - Network efficiency: larger buffer reduces system calls
+         *
+         * Increased from 2048 to 4096 to better handle chunked encoding where:
+         * - Each chunk has overhead (size line in hex + 2x\r\n = ~10 bytes)
+         * - Multiple chunks may arrive in single TCP packet
+         * - Larger buffer reduces parsing complexity at chunk boundaries
+         */
+        private const val READ_BUFFER_SIZE = 4096
+
+        /**
+         * Log RTCM extraction progress every N bytes to provide ongoing visibility.
+         * Set to 10KB intervals to balance between information and log spam.
+         */
+        private const val LOG_INTERVAL_BYTES = 10240L  // 10 KB
+
+        /**
+         * Maximum number of consecutive chunk size parsing failures before treating as raw data.
+         * Helps detect genuine protocol switches vs. corrupted data.
+         */
+        private const val MAX_CHUNK_PARSE_FAILURES = 3
     }
 
     private var socket: Socket? = null
@@ -127,12 +155,15 @@ class NtripClient(
 
             onLog("Starting RTCM data stream...")
             // 3. Start reading RTCM stream with chunked transfer encoding support
-            val buffer = ByteArray(4096)
+            val buffer = ByteArray(READ_BUFFER_SIZE)
             var totalBytesRead = 0L
             var rtcmBytesExtracted = 0L
+            var lastLoggedBytes = 0L
             val chunkBuffer = java.io.ByteArrayOutputStream()
             var readingChunkSize = true
             var remainingChunkSize = 0
+            var consecutiveChunkParseFailures = 0
+            var usingRawMode = false  // Track if we've switched to raw data mode
 
             while (isActive && !isDisconnecting) {
                 val bytesRead = inputStream.read(buffer)
@@ -144,42 +175,70 @@ class NtripClient(
                 if (bytesRead > 0) {
                     totalBytesRead += bytesRead
 
-                    // Process chunked transfer encoding
-                    var offset = 0
-                    while (offset < bytesRead) {
-                        if (readingChunkSize) {
-                            // Read chunk size line (hex number followed by \r\n)
-                            val lineEnd = findLineEnd(buffer, offset, bytesRead)
-                            if (lineEnd == -1) {
-                                // Need more data to complete chunk size line
-                                break
-                            }
-
-                            val chunkSizeLine = String(buffer, offset, lineEnd - offset, Charsets.US_ASCII).trim()
-                            offset = lineEnd + 2 // Skip \r\n
-
-                            if (chunkSizeLine.isEmpty()) {
-                                // Empty line, skip it
-                                continue
-                            }
-
-                            try {
-                                remainingChunkSize = chunkSizeLine.toInt(16)
-                                if (remainingChunkSize == 0) {
-                                    // Last chunk, connection ending
-                                    onLog("NTRIP stream ended (chunk size 0)")
-                                    return@withContext
+                    // If we've switched to raw mode due to repeated failures, just pass through data
+                    if (usingRawMode) {
+                        onDataReceived(buffer.copyOf(bytesRead))
+                        rtcmBytesExtracted += bytesRead
+                    } else {
+                        // Process chunked transfer encoding
+                        var offset = 0
+                        while (offset < bytesRead && !usingRawMode) {
+                            if (readingChunkSize) {
+                                // Read chunk size line (hex number followed by \r\n)
+                                val lineEnd = findLineEnd(buffer, offset, bytesRead)
+                                if (lineEnd == -1) {
+                                    // Need more data to complete chunk size line
+                                    break
                                 }
-                                readingChunkSize = false
-                            } catch (e: NumberFormatException) {
-                                // Not a valid chunk size, might be raw RTCM data
-                                // Fall back to treating as raw data
-                                onDataReceived(buffer.copyOfRange(offset - chunkSizeLine.length - 2, bytesRead))
-                                rtcmBytesExtracted += (bytesRead - (offset - chunkSizeLine.length - 2))
-                                break
-                            }
-                        } else {
-                            // Read chunk data
+
+                                val chunkSizeLine = String(buffer, offset, lineEnd - offset, Charsets.US_ASCII).trim()
+                                offset = lineEnd + 2 // Skip \r\n
+
+                                if (chunkSizeLine.isEmpty()) {
+                                    // Empty line, skip it
+                                    continue
+                                }
+
+                                try {
+                                    remainingChunkSize = chunkSizeLine.toInt(16)
+                                    if (remainingChunkSize == 0) {
+                                        // Last chunk, connection ending
+                                        onLog("NTRIP stream ended (chunk size 0)")
+                                        return@withContext
+                                    }
+                                    readingChunkSize = false
+                                    consecutiveChunkParseFailures = 0  // Reset on success
+                                } catch (e: NumberFormatException) {
+                                    consecutiveChunkParseFailures++
+
+                                    // Check if this looks like raw RTCM data (starts with 0xD3 sync byte)
+                                    val firstByte = if (chunkSizeLine.isNotEmpty()) chunkSizeLine[0].code else 0
+                                    val looksLikeRtcm = firstByte == 0xD3 || buffer[offset - chunkSizeLine.length - 2].toInt() and 0xFF == 0xD3
+
+                                    if (consecutiveChunkParseFailures >= MAX_CHUNK_PARSE_FAILURES) {
+                                        // Multiple failures - switch to raw mode permanently for this connection
+                                        onLog("WARNING: Chunked encoding parse failed $consecutiveChunkParseFailures times - switching to raw RTCM mode")
+                                        usingRawMode = true
+                                        // Process remaining data in buffer as raw
+                                        val remainingData = buffer.copyOfRange(offset - chunkSizeLine.length - 2, bytesRead)
+                                        onDataReceived(remainingData)
+                                        rtcmBytesExtracted += remainingData.size
+                                        break
+                                    } else if (looksLikeRtcm) {
+                                        // Looks like RTCM data - temporarily treat this buffer as raw
+                                        onLog("WARNING: Chunk size parse failed (attempt $consecutiveChunkParseFailures/$MAX_CHUNK_PARSE_FAILURES), but data appears to be RTCM (sync byte 0xD3)")
+                                        val remainingData = buffer.copyOfRange(offset - chunkSizeLine.length - 2, bytesRead)
+                                        onDataReceived(remainingData)
+                                        rtcmBytesExtracted += remainingData.size
+                                        break
+                                    } else {
+                                        // Doesn't look like RTCM - log error and skip this data
+                                        onLog("ERROR: Invalid chunk size '$chunkSizeLine' and no RTCM sync byte detected - possible data corruption (attempt $consecutiveChunkParseFailures/$MAX_CHUNK_PARSE_FAILURES)")
+                                        break
+                                    }
+                                }
+                            } else {
+                                // Read chunk data
                             val bytesToRead = minOf(remainingChunkSize, bytesRead - offset)
                             chunkBuffer.write(buffer, offset, bytesToRead)
                             offset += bytesToRead
@@ -202,10 +261,13 @@ class NtripClient(
                             }
                         }
                     }
+                    }
 
-                    // Log first data reception
-                    if (rtcmBytesExtracted > 0 && rtcmBytesExtracted <= 1024) {
-                        onLog("RTCM data extracted: $rtcmBytesExtracted bytes (from $totalBytesRead total)")
+                    // Periodic logging for ongoing visibility (every LOG_INTERVAL_BYTES)
+                    if (rtcmBytesExtracted - lastLoggedBytes >= LOG_INTERVAL_BYTES) {
+                        val mode = if (usingRawMode) "raw" else "chunked"
+                        onLog("RTCM data extracted: $rtcmBytesExtracted bytes (from $totalBytesRead total, mode: $mode)")
+                        lastLoggedBytes = rtcmBytesExtracted
                     }
                 }
             }

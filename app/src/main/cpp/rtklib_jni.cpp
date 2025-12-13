@@ -20,6 +20,34 @@
 #define MAX_ITER 10                 // Maximum iterations for position solution
 #define CONVERGENCE_THRESHOLD 1e-4  // meters
 
+/**
+ * CONFIGURABLE PARAMETERS
+ *
+ * Production-quality thresholds for RTK positioning.
+ * These can be adjusted based on application requirements.
+ */
+
+// CN0 threshold for satellite signal quality (dB-Hz)
+// Values: 15 = permissive (faster initial fix, more noise)
+//         20 = balanced (recommended for production)
+//         25 = strict (high quality only, slower fix)
+#define CN0_THRESHOLD_DB_HZ 20.0
+
+// Epsilon for numerical stability in matrix operations
+// Prevents division by near-zero values in Gaussian elimination
+#define MATRIX_PIVOT_EPSILON 1e-10
+
+// DEMO/TEST CONFIGURATION FLAGS
+// Set to false for production to disable simulated corrections
+#define USE_SIMULATED_CORRECTIONS false
+
+// Simulated correction parameters (only used if USE_SIMULATED_CORRECTIONS is true)
+// WARNING: These are hardcoded demo values - NOT for production use
+#define DEMO_CORRECTION_X_METERS 1.5
+#define DEMO_CORRECTION_Y_METERS -0.8
+#define DEMO_CORRECTION_Z_METERS 2.1
+#define DEMO_CORRECTION_SMOOTHING 0.95  // Exponential smoothing factor (0-1)
+
 // Satellite position approximation (simplified - assumes circular orbits)
 struct SatellitePos {
     double x, y, z;  // ECEF coordinates in meters
@@ -88,9 +116,35 @@ void ecefToGeodetic(double x, double y, double z, double &lat, double &lon, doub
     height = h0;
 }
 
-// Simplified satellite position calculation
-// NOTE: This is a very simplified approximation for GPS satellites
-// Real implementation would use ephemeris data from navigation messages
+/**
+ * CRITICAL LIMITATION: Simplified satellite position calculation
+ *
+ * WARNING: This function uses a HIGHLY SIMPLIFIED orbital model that will produce
+ * satellite positions with errors of 10-50 kilometers or more!
+ *
+ * Limitations:
+ * - Assumes perfectly circular orbits (real orbits are elliptical)
+ * - Ignores orbital perturbations (gravitational anomalies, solar pressure, etc.)
+ * - Does not use actual satellite ephemeris data
+ * - Ignores satellite clock corrections
+ * - Does not account for Earth rotation during signal propagation
+ *
+ * Impact on positioning:
+ * - Position errors: 10-50 meters or more
+ * - Unreliable for precision applications
+ * - RTK corrections cannot compensate for these systematic errors
+ *
+ * For production use, MUST implement:
+ * - Ephemeris parsing from RTCM messages (types 1019, 1020, 1045, 1046)
+ * - Or ephemeris from GPS/GLONASS/Galileo navigation messages
+ * - Proper Kepler orbital mechanics calculations
+ * - Satellite clock corrections
+ *
+ * This simplified model is ONLY suitable for:
+ * - Initial prototyping
+ * - Algorithm testing with simulated data
+ * - Educational demonstrations
+ */
 SatellitePos getSatellitePosition(int svid, int constellation, double time) {
     SatellitePos pos;
 
@@ -211,11 +265,10 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
 
     double result[7];
 
-    // Filter valid measurements
-    // CN0 threshold: 15 dB-Hz (lowered from 20 for faster initial fix - production should use 20-25)
+    // Filter valid measurements using configured CN0 threshold
     std::vector<Measurement> validMeas;
     for (int i = 0; i < size; i++) {
-        if (prArray[i] > 0 && prArray[i] < 3e8 && cn0Array[i] > 15.0) {
+        if (prArray[i] > 0 && prArray[i] < 3e8 && cn0Array[i] > CN0_THRESHOLD_DB_HZ) {
             Measurement m;
             m.svid = svidArray[i];
             m.constellation = constArray[i];
@@ -226,7 +279,7 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
         }
     }
 
-    LOGI("Valid measurements: %d / %d (filtered by CN0 > 15 dB-Hz)", (int)validMeas.size(), size);
+    LOGI("Valid measurements: %d / %d (filtered by CN0 > %.1f dB-Hz)", (int)validMeas.size(), size, CN0_THRESHOLD_DB_HZ);
 
     // Need at least 4 satellites for 3D position + clock bias
     if (validMeas.size() >= 4) {
@@ -323,6 +376,30 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
                     }
                 }
 
+                // Check for zero or near-zero pivot
+                if (fabs(A[i][i]) < MATRIX_PIVOT_EPSILON) {
+                    LOGE("Matrix is singular or ill-conditioned at row %d (pivot = %.2e) - cannot solve", i, A[i][i]);
+                    // Matrix is degenerate - cannot compute position
+                    // Return previous position or zeros
+                    result[0] = gRtkState.latitude;
+                    result[1] = gRtkState.longitude;
+                    result[2] = gRtkState.height;
+                    result[3] = (double)gRtkState.solutionStatus;
+                    result[4] = gRtkState.latitude;
+                    result[5] = gRtkState.longitude;
+                    result[6] = gRtkState.height;
+
+                    env->ReleaseIntArrayElements(svid, svidArray, JNI_ABORT);
+                    env->ReleaseIntArrayElements(constellation, constArray, JNI_ABORT);
+                    env->ReleaseDoubleArrayElements(pseudorange, prArray, JNI_ABORT);
+                    env->ReleaseDoubleArrayElements(carrierPhase, cpArray, JNI_ABORT);
+                    env->ReleaseDoubleArrayElements(cn0, cn0Array, JNI_ABORT);
+
+                    jdoubleArray resultArray = env->NewDoubleArray(7);
+                    env->SetDoubleArrayRegion(resultArray, 0, 7, result);
+                    return resultArray;
+                }
+
                 // Eliminate column
                 for (int k = i + 1; k < 4; k++) {
                     double factor = A[k][i] / A[i][i];
@@ -335,6 +412,29 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
             // Back substitution
             double dx_solution[4];
             for (int i = 3; i >= 0; i--) {
+                // Check for zero diagonal (should not happen after forward elimination, but be safe)
+                if (fabs(A[i][i]) < MATRIX_PIVOT_EPSILON) {
+                    LOGE("Zero diagonal element at row %d during back substitution", i);
+                    // Return previous position
+                    result[0] = gRtkState.latitude;
+                    result[1] = gRtkState.longitude;
+                    result[2] = gRtkState.height;
+                    result[3] = (double)gRtkState.solutionStatus;
+                    result[4] = gRtkState.latitude;
+                    result[5] = gRtkState.longitude;
+                    result[6] = gRtkState.height;
+
+                    env->ReleaseIntArrayElements(svid, svidArray, JNI_ABORT);
+                    env->ReleaseIntArrayElements(constellation, constArray, JNI_ABORT);
+                    env->ReleaseDoubleArrayElements(pseudorange, prArray, JNI_ABORT);
+                    env->ReleaseDoubleArrayElements(carrierPhase, cpArray, JNI_ABORT);
+                    env->ReleaseDoubleArrayElements(cn0, cn0Array, JNI_ABORT);
+
+                    jdoubleArray resultArray = env->NewDoubleArray(7);
+                    env->SetDoubleArrayRegion(resultArray, 0, 7, result);
+                    return resultArray;
+                }
+
                 dx_solution[i] = A[i][4];
                 for (int j = i + 1; j < 4; j++) {
                     dx_solution[i] -= A[i][j] * dx_solution[j];
@@ -523,38 +623,55 @@ Java_com_pg_rtk_service_RtkLibNative_processRtcmData(
     // Track RTCM reception and improve solution status
     gRtkState.rtcmCount++;
 
-    // SIMPLIFIED DIFFERENTIAL CORRECTION
-    // In a real implementation, we would:
-    // 1. Parse RTCM messages to extract base station observations
-    // 2. Compute double-differences with rover observations
-    // 3. Solve for precise corrections
-    //
-    // For this demo, we simulate the effect of RTCM corrections:
-    // - Generate small random corrections that stabilize over time
-    // - This demonstrates how corrections improve position
+    /**
+     * DIFFERENTIAL CORRECTION PROCESSING
+     *
+     * Production Implementation Required:
+     * 1. Parse RTCM messages to extract base station observations
+     * 2. Compute double-differences with rover observations
+     * 3. Solve for precise corrections using Kalman filter
+     * 4. Apply ionospheric and tropospheric corrections
+     *
+     * Current Status: DEMO/SIMULATION MODE
+     * - Hardcoded correction values for demonstration only
+     * - NOT suitable for production use
+     * - Real RTCM parsing and correction computation needed
+     */
 
+#if USE_SIMULATED_CORRECTIONS
+    // DEMO MODE: Simulated corrections for demonstration purposes only
+    // WARNING: This is test code - not for production use
     if (gRtkState.rtcmCount > 3) {
         // Build up correction weight gradually
         gRtkState.correctionWeight = std::min(1.0, gRtkState.correctionWeight + 0.05);
 
-        // Simulate differential corrections (normally computed from RTCM data)
-        // In reality, these would be computed from base station observations
-        // For demo: small corrections that improve position (1-3 meters typical for DGPS)
         if (gRtkState.rtcmCount == 4) {
-            // Initialize corrections (simulated - would come from RTCM processing)
-            gRtkState.correctionX = 1.5;  // meters (example correction)
-            gRtkState.correctionY = -0.8; // meters
-            gRtkState.correctionZ = 2.1;  // meters
-            LOGI("Differential corrections initialized from RTCM data");
+            // Initialize with demo correction values
+            gRtkState.correctionX = DEMO_CORRECTION_X_METERS;
+            gRtkState.correctionY = DEMO_CORRECTION_Y_METERS;
+            gRtkState.correctionZ = DEMO_CORRECTION_Z_METERS;
+            LOGI("[DEMO MODE] Simulated differential corrections initialized: X=%.1f, Y=%.1f, Z=%.1f meters",
+                 DEMO_CORRECTION_X_METERS, DEMO_CORRECTION_Y_METERS, DEMO_CORRECTION_Z_METERS);
         }
 
-        // Smooth corrections over time (exponential smoothing)
-        // In reality, corrections update based on new RTCM messages
-        const double smoothing = 0.95;
-        gRtkState.correctionX *= smoothing;
-        gRtkState.correctionY *= smoothing;
-        gRtkState.correctionZ *= smoothing;
+        // Apply exponential smoothing (demo behavior - simulates correction convergence)
+        gRtkState.correctionX *= DEMO_CORRECTION_SMOOTHING;
+        gRtkState.correctionY *= DEMO_CORRECTION_SMOOTHING;
+        gRtkState.correctionZ *= DEMO_CORRECTION_SMOOTHING;
     }
+#else
+    // PRODUCTION MODE: Real RTCM correction processing
+    // TODO: Implement actual RTCM message parsing and correction computation
+    // For now, no corrections are applied (operating in SINGLE mode)
+    if (gRtkState.rtcmCount > 3) {
+        LOGE("WARNING: RTCM data received but correction processing not implemented - operating in SINGLE mode");
+        // Set corrections to zero until real implementation is complete
+        gRtkState.correctionX = 0.0;
+        gRtkState.correctionY = 0.0;
+        gRtkState.correctionZ = 0.0;
+        gRtkState.correctionWeight = 0.0;
+    }
+#endif
 
     // Upgrade solution status based on RTCM data quality and quantity
     if (gRtkState.rtcmCount > 5 && gRtkState.solutionStatus < 2) {

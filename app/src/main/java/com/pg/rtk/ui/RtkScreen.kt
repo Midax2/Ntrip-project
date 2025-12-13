@@ -46,6 +46,12 @@ import com.pg.rtk.data.RtkState
 import com.pg.rtk.data.RtkStatus
 import java.util.Locale
 
+/**
+ * Minimum time in milliseconds between button clicks to prevent accidental double-clicks.
+ * This debounce delay helps avoid multiple rapid connection/disconnection attempts.
+ */
+private const val BUTTON_DEBOUNCE_MILLIS = 1000L
+
 @Composable
 fun RtkScreen(viewModel: RtkViewModel) {
     val state by viewModel.rtkState.collectAsState()
@@ -202,18 +208,17 @@ fun NtripConfigSection(
 
             val isValidConfig = config.host.isNotBlank() && config.host.length >= 3 &&
                                config.mountPoint.isNotBlank() && config.mountPoint.length >= 2 &&
-                               config.user.isNotBlank() && config.user.isNotEmpty() &&
-                               config.password.isNotBlank() && config.password.isNotEmpty() &&
-                               !portError &&
-                               config.port in 1..65535
+                               config.user.isNotBlank() &&
+                               config.password.isNotBlank() &&
+                               !portError
 
             Button(
                 onClick = {
                     android.util.Log.d("NtripButton", "Button clicked! isConnected=$isConnected, isValidConfig=$isValidConfig")
 
-                    // Debounce: prevent rapid-fire clicks (minimum 1 second between clicks)
+                    // Debounce: prevent rapid-fire clicks
                     val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastClickTime < 1000) {
+                    if (currentTime - lastClickTime < BUTTON_DEBOUNCE_MILLIS) {
                         android.util.Log.d("NtripButton", "Click ignored - too soon after last click")
                         return@Button
                     }

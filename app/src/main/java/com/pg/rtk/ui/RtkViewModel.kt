@@ -8,6 +8,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pg.rtk.data.NtripConfig
@@ -33,6 +36,34 @@ class RtkViewModel(
 
     companion object {
         private const val TAG = "RtkViewModel"
+
+        /**
+         * Minimum absolute coordinate value (in degrees) to consider a position valid.
+         *
+         * Rationale for 0.1 degrees:
+         * - 0.1° ≈ 11 km at the equator
+         * - Any legitimate position on Earth is farther than 0.1° from the origin (0°N, 0°E)
+         * - The origin point is in the Atlantic Ocean (Gulf of Guinea), far from land
+         * - Filters out uninitialized positions (0.0, 0.0) and near-zero garbage values
+         * - Small enough to not exclude valid positions near the equator
+         *
+         * Valid positions will have |latitude| > 0.1 OR |longitude| > 0.1
+         * Invalid positions near (0, 0) will have both |latitude| ≤ 0.1 AND |longitude| ≤ 0.1
+         */
+        private const val MIN_VALID_COORDINATE_DEGREES = 0.1
+
+        /**
+         * Maximum length of NTRIP connection log in characters.
+         *
+         * Purpose:
+         * - Prevents unbounded memory growth from accumulated log messages
+         * - 500 chars ≈ 5-10 log lines with typical message lengths
+         * - Keeps recent messages visible while discarding old ones
+         * - Balance between information retention and memory efficiency
+         *
+         * When log exceeds this limit, oldest messages are discarded (takeLast(500))
+         */
+        private const val MAX_NTRIP_LOG_LENGTH = 500
     }
 
     private val _rtkState = MutableStateFlow(RtkState())
@@ -55,36 +86,72 @@ class RtkViewModel(
     private var ntripJob: Job? = null
     private var isGnssListening = false
 
-    // Tracking variables for monitoring
-    private var ntripConnectionStartTime: Long = 0
-    private var ntripBytesReceived: Long = 0
-    private var rtcmMessageTypeCount = mutableMapOf<Int, Int>()
+    // Tracking variables for monitoring (thread-safe using atomic operations)
+    private val ntripConnectionStartTime = AtomicLong(0)
+    private val ntripBytesReceived = AtomicLong(0)
+    private val rtcmMessageTypeCount = ConcurrentHashMap<Int, AtomicInteger>()
+
+    /**
+     * Determines the appropriate RTK status based on current and new states.
+     *
+     * State Machine Rules:
+     * 1. HIGH_ACCURACY states (FIX, FLOAT) always take precedence - they represent achieved positioning quality
+     * 2. NTRIP_CONNECTION states (CONNECTING_NTRIP, RECEIVING_RTCM) are maintained while connection is active
+     * 3. POSITIONING states (SINGLE) don't override connection states
+     * 4. DISCONNECTED is the base state and doesn't auto-upgrade
+     *
+     * State Priority (highest to lowest):
+     * - FIX (cm-level accuracy achieved)
+     * - FLOAT (dm-level accuracy achieved)
+     * - RECEIVING_RTCM (NTRIP connected, data flowing)
+     * - CONNECTING_NTRIP (NTRIP connection in progress)
+     * - SINGLE (GPS only, no corrections)
+     * - DISCONNECTED (no NTRIP connection)
+     *
+     * @param currentStatus The current RTK status
+     * @param newStatus The status from RTK engine (based on solution quality)
+     * @param hasRtcmData Whether RTCM correction data is available (rtcmMessageCount > 0)
+     * @return The resolved status to use
+     */
+    private fun resolveRtkStatus(
+        currentStatus: RtkStatus,
+        newStatus: RtkStatus,
+        hasRtcmData: Boolean
+    ): RtkStatus = when {
+        // Rule 1: High-accuracy positioning states always take priority
+        newStatus == RtkStatus.FIX || newStatus == RtkStatus.FLOAT -> newStatus
+
+        // Rule 2: Maintain RECEIVING_RTCM while RTCM data is flowing
+        currentStatus == RtkStatus.RECEIVING_RTCM && hasRtcmData -> RtkStatus.RECEIVING_RTCM
+
+        // Rule 3: Transition from CONNECTING to RECEIVING when RTCM data arrives
+        currentStatus == RtkStatus.CONNECTING_NTRIP && hasRtcmData -> RtkStatus.RECEIVING_RTCM
+
+        // Rule 4: Maintain CONNECTING_NTRIP (don't downgrade to SINGLE while connecting)
+        currentStatus == RtkStatus.CONNECTING_NTRIP && newStatus == RtkStatus.SINGLE -> RtkStatus.CONNECTING_NTRIP
+
+        // Rule 5: Maintain DISCONNECTED (don't auto-upgrade to SINGLE from positioning engine)
+        currentStatus == RtkStatus.DISCONNECTED && newStatus == RtkStatus.SINGLE -> RtkStatus.DISCONNECTED
+
+        // Rule 6: Default - use the new status from positioning engine
+        else -> newStatus
+    }
 
     // Initialize the GNSS Engine
     private val rtkEngine = RtkEngine { newState ->
         _rtkState.update { currentState ->
-            // Smart status update: distinguish between NTRIP connection states and positioning quality
-            val finalStatus = when {
-                // Always upgrade to FIX or FLOAT if available (positioning quality)
-                newState.status == RtkStatus.FIX || newState.status == RtkStatus.FLOAT -> newState.status
-                // Keep RECEIVING_RTCM if we have RTCM messages (NTRIP connected)
-                currentState.status == RtkStatus.RECEIVING_RTCM && newState.rtcmMessageCount > 0 -> RtkStatus.RECEIVING_RTCM
-                // Allow transition FROM CONNECTING_NTRIP if we got RTCM data
-                currentState.status == RtkStatus.CONNECTING_NTRIP && newState.rtcmMessageCount > 0 -> RtkStatus.RECEIVING_RTCM
-                // Keep CONNECTING_NTRIP while connecting (don't change to SINGLE)
-                currentState.status == RtkStatus.CONNECTING_NTRIP && newState.status == RtkStatus.SINGLE -> RtkStatus.CONNECTING_NTRIP
-                // Keep DISCONNECTED if we're not connected and not connecting (don't auto-change to SINGLE)
-                currentState.status == RtkStatus.DISCONNECTED && newState.status == RtkStatus.SINGLE -> RtkStatus.DISCONNECTED
-                // Otherwise use the new status
-                else -> newState.status
-            }
+            val finalStatus = resolveRtkStatus(
+                currentStatus = currentState.status,
+                newStatus = newState.status,
+                hasRtcmData = newState.rtcmMessageCount > 0
+            )
 
             currentState.copy(
                 uncorrected = newState.uncorrected,
                 // Only update corrected position if it's actually valid
                 // Check if coordinates are meaningful (not 0,0,0 and not very small values near origin)
-                corrected = if (kotlin.math.abs(newState.corrected.latitude) > 0.1 ||
-                               kotlin.math.abs(newState.corrected.longitude) > 0.1) {
+                corrected = if (kotlin.math.abs(newState.corrected.latitude) > MIN_VALID_COORDINATE_DEGREES ||
+                               kotlin.math.abs(newState.corrected.longitude) > MIN_VALID_COORDINATE_DEGREES) {
                     newState.corrected
                 } else {
                     // Keep existing corrected position if new one is invalid
@@ -200,8 +267,7 @@ class RtkViewModel(
      * @see updateConfig
      */
     fun connectNtrip() {
-        // Log stack trace to see where this is being called from
-        Log.w(TAG, "connectNtrip() called", Exception("Stack trace for debugging"))
+        Log.d(TAG, "connectNtrip() called from thread: ${Thread.currentThread().name}")
 
         viewModelScope.launch {
             ntripMutex.withLock {
@@ -229,9 +295,9 @@ class RtkViewModel(
                 _rtkState.update { it.copy(status = RtkStatus.CONNECTING_NTRIP, ntripLog = "") }
                 rtkEngine.reset() // Reset engine state upon new connection attempt
 
-                // Reset NTRIP monitoring
-                ntripConnectionStartTime = 0
-                ntripBytesReceived = 0
+                // Reset NTRIP monitoring (thread-safe)
+                ntripConnectionStartTime.set(0)
+                ntripBytesReceived.set(0)
                 rtcmMessageTypeCount.clear()
                 _ntripStatusState.value = NtripStatusState()
 
@@ -244,11 +310,11 @@ class RtkViewModel(
                     },
                     onLog = { log ->
                         _rtkState.update { currentState ->
-                            // Accumulate logs with newlines, keep last 500 chars to prevent memory issues
+                            // Accumulate logs with newlines, keep last MAX_NTRIP_LOG_LENGTH chars to prevent memory issues
                             val newLog = if (currentState.ntripLog.isEmpty()) {
                                 log
                             } else {
-                                (currentState.ntripLog + "\n" + log).takeLast(500)
+                                (currentState.ntripLog + "\n" + log).takeLast(MAX_NTRIP_LOG_LENGTH)
                             }
                             currentState.copy(ntripLog = newLog)
                         }
@@ -256,7 +322,7 @@ class RtkViewModel(
                         // Update status based on log messages
                         when {
                             log.contains("200 OK") && log.contains("Connection successful") -> {
-                                ntripConnectionStartTime = System.currentTimeMillis()
+                                ntripConnectionStartTime.set(System.currentTimeMillis())
                                 _rtkState.update { it.copy(status = RtkStatus.RECEIVING_RTCM) }
                             }
                             log.startsWith("Connection Error:") || log.startsWith("Connection rejected") -> {
@@ -398,23 +464,24 @@ class RtkViewModel(
     }
 
     /**
-     * Update NTRIP status when data is received
+     * Update NTRIP status when data is received (thread-safe using atomic operations)
      */
     private fun updateNtripStatus(data: ByteArray) {
-        ntripBytesReceived += data.size
+        ntripBytesReceived.addAndGet(data.size.toLong())
 
         // Try to extract RTCM message type (simplified - RTCM messages start with D3)
         if (data.size >= 3 && data[0].toInt() and 0xFF == 0xD3) {
             // Extract message type from RTCM3 header (bits 24-35 of the message)
             if (data.size >= 6) {
                 val messageType = ((data[3].toInt() and 0xFF) shl 4) or ((data[4].toInt() and 0xF0) shr 4)
-                rtcmMessageTypeCount[messageType] = (rtcmMessageTypeCount[messageType] ?: 0) + 1
+                rtcmMessageTypeCount.computeIfAbsent(messageType) { AtomicInteger(0) }.incrementAndGet()
             }
         }
 
         // Format duration
-        val duration = if (ntripConnectionStartTime > 0) {
-            val elapsedMillis = System.currentTimeMillis() - ntripConnectionStartTime
+        val startTime = ntripConnectionStartTime.get()
+        val duration = if (startTime > 0) {
+            val elapsedMillis = System.currentTimeMillis() - startTime
             val hours = TimeUnit.MILLISECONDS.toHours(elapsedMillis)
             val minutes = TimeUnit.MILLISECONDS.toMinutes(elapsedMillis) % 60
             val seconds = TimeUnit.MILLISECONDS.toSeconds(elapsedMillis) % 60
@@ -424,9 +491,10 @@ class RtkViewModel(
         }
 
         // Calculate data rate
-        val dataRate = if (ntripConnectionStartTime > 0) {
-            val elapsedSeconds = (System.currentTimeMillis() - ntripConnectionStartTime) / 1000.0
-            if (elapsedSeconds > 0) ntripBytesReceived / elapsedSeconds else 0.0
+        val dataRate = if (startTime > 0) {
+            val elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000.0
+            val bytesReceived = ntripBytesReceived.get()
+            if (elapsedSeconds > 0) bytesReceived / elapsedSeconds else 0.0
         } else {
             0.0
         }
@@ -438,10 +506,10 @@ class RtkViewModel(
 
         _ntripStatusState.update {
             it.copy(
-                bytesReceived = ntripBytesReceived,
+                bytesReceived = ntripBytesReceived.get(),
                 connectionDuration = duration,
                 dataRate = dataRate,
-                rtcmMessageTypes = rtcmMessageTypeCount.toMap(),
+                rtcmMessageTypes = rtcmMessageTypeCount.mapValues { entry -> entry.value.get() },
                 lastRtcmData = hexData
             )
         }
