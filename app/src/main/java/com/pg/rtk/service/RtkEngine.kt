@@ -2,11 +2,11 @@ package com.pg.rtk.service
 
 import android.location.GnssMeasurementsEvent
 import android.location.GnssMeasurement
-import android.os.Build
-import androidx.annotation.RequiresApi
 import com.pg.rtk.data.Coordinate
 import com.pg.rtk.data.RtkState
 import com.pg.rtk.data.RtkStatus
+import kotlin.math.cos
+import kotlin.math.sqrt
 
 class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
@@ -44,7 +44,6 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
         return travelTimeNanos * SPEED_OF_LIGHT / 1e9
     }
 
-    @RequiresApi(Build.VERSION_CODES.O)
     fun processRawGnssData(event: GnssMeasurementsEvent) {
         val measurements = event.measurements.filter {
             it.hasCarrierFrequencyHz() &&
@@ -60,7 +59,17 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             calculatePseudorange(measurements[it], event.clock.timeNanos)
         }
         val carrierPhases = DoubleArray(measurements.size) {
-            if (measurements[it].hasCarrierPhase()) measurements[it].carrierPhase else 0.0
+            // Check if carrier phase is available via state flags instead of deprecated hasCarrierPhase()
+            if (measurements[it].state and GnssMeasurement.STATE_TOW_DECODED != 0) {
+                // Carrier phase available - access directly (property not deprecated, only hasCarrierPhase() method)
+                try {
+                    measurements[it].accumulatedDeltaRangeMeters
+                } catch (_: Exception) {
+                    0.0
+                }
+            } else {
+                0.0
+            }
         }
         val cn0s = DoubleArray(measurements.size) { measurements[it].cn0DbHz }
 
@@ -79,15 +88,17 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
         // If the native library doesn't provide uncorrected position (result.size < 7),
         // we'll use the corrected position as a fallback
         if (result.size >= 4) {
-            currentCorrected = Coordinate(result[0], result[1], result[2])
-            updateStatusFromSolution(result[3].toInt())
+            synchronized(this) {
+                currentCorrected = Coordinate(result[0], result[1], result[2])
+                updateStatusFromSolution(result[3].toInt())
 
-            // Update uncorrected position if available, otherwise use corrected as fallback
-            if (result.size >= 7) {
-                currentUncorrected = Coordinate(result[4], result[5], result[6])
-            } else {
-                // Use corrected position as uncorrected (single point solution)
-                currentUncorrected = currentCorrected
+                // Update uncorrected position if available, otherwise use corrected as fallback
+                if (result.size >= 7) {
+                    currentUncorrected = Coordinate(result[4], result[5], result[6])
+                } else {
+                    // Use corrected position as uncorrected (single point solution)
+                    currentUncorrected = currentCorrected
+                }
             }
         }
 
@@ -96,9 +107,11 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
     fun processRtcmData(data: ByteArray) {
         if (RtkLibNative.processRtcmData(data, data.size)) {
-            rtcmMessageCount++
-            val solutionStatus = RtkLibNative.getSolutionStatus()
-            updateStatusFromSolution(solutionStatus)
+            synchronized(this) {
+                rtcmMessageCount++
+                val solutionStatus = RtkLibNative.getSolutionStatus()
+                updateStatusFromSolution(solutionStatus)
+            }
             updateStateThrottled()
         }
     }
@@ -113,27 +126,25 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     }
 
     /**
-     * Calculate distance between two coordinates in meters (simplified Haversine)
+     * Fast distance calculation using Euclidean approximation.
+     * Suitable for small distances (< few km) which is typical for RTK positioning.
+     * Avoids expensive trigonometric operations (sin, cos, atan2).
+     *
+     * Approximation: at mid-latitudes, 1° latitude ≈ 111km, 1° longitude ≈ 111km * cos(lat)
      */
-    private fun calculateDistance(coord1: Coordinate, coord2: Coordinate): Double {
-        val lat1Rad = Math.toRadians(coord1.latitude)
-        val lat2Rad = Math.toRadians(coord2.latitude)
-        val lon1Rad = Math.toRadians(coord1.longitude)
-        val lon2Rad = Math.toRadians(coord2.longitude)
+    private fun calculateDistanceFast(coord1: Coordinate, coord2: Coordinate): Double {
+        // Degrees to meters conversion factors
+        val metersPerDegreeLat = 111000.0 // approximately constant
+        val avgLat = (coord1.latitude + coord2.latitude) / 2.0
+        val metersPerDegreeLon = 111000.0 * cos(Math.toRadians(avgLat))
 
-        val dLat = lat2Rad - lat1Rad
-        val dLon = lon2Rad - lon1Rad
+        // Calculate differences in meters
+        val dLatMeters = (coord2.latitude - coord1.latitude) * metersPerDegreeLat
+        val dLonMeters = (coord2.longitude - coord1.longitude) * metersPerDegreeLon
         val dHeight = coord2.height - coord1.height
 
-        // Simplified distance calculation
-        val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                Math.cos(lat1Rad) * Math.cos(lat2Rad) *
-                Math.sin(dLon / 2) * Math.sin(dLon / 2)
-        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-        val earthRadius = 6371000.0 // meters
-        val horizontalDist = earthRadius * c
-
-        return Math.sqrt(horizontalDist * horizontalDist + dHeight * dHeight)
+        // Euclidean distance (much faster than Haversine)
+        return sqrt(dLatMeters * dLatMeters + dLonMeters * dLonMeters + dHeight * dHeight)
     }
 
     /**
@@ -141,49 +152,66 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
      */
     private fun updateStateThrottled() {
         val currentTime = System.currentTimeMillis()
-        val timeSinceLastUpdate = currentTime - lastUpdateTime
 
-        val newState = RtkState(
-            uncorrected = currentUncorrected,
-            corrected = currentCorrected,
-            status = status,
-            rtcmMessageCount = rtcmMessageCount
-        )
+        val (newState, statusChanged, isFirstUpdate, positionChanged, timeSinceLastUpdate) = synchronized(this) {
+            val timeSince = currentTime - lastUpdateTime
 
-        // Always update if status changed or this is the first update
-        val statusChanged = lastState?.status != newState.status
-        val isFirstUpdate = lastState == null
+            val state = RtkState(
+                uncorrected = currentUncorrected,
+                corrected = currentCorrected,
+                status = status,
+                rtcmMessageCount = rtcmMessageCount
+            )
 
-        // Check if position changed significantly
-        val positionChanged = lastState?.let {
-            calculateDistance(it.corrected, newState.corrected) >= MIN_POSITION_CHANGE_M
-        } ?: true
+            // Always update if status changed or this is the first update
+            val statusChange = lastState?.status != state.status
+            val firstUpdate = lastState == null
+
+            // Check if position changed significantly
+            val posChange = lastState?.let {
+                calculateDistanceFast(it.corrected, state.corrected) >= MIN_POSITION_CHANGE_M
+            } ?: true
+
+            Tuple5(state, statusChange, firstUpdate, posChange, timeSince)
+        }
 
         // Update if: status changed, first update, or (enough time passed AND position changed)
         if (statusChanged || isFirstUpdate ||
             (timeSinceLastUpdate >= UPDATE_THROTTLE_MS && positionChanged)) {
             onRtkStatusUpdate(newState)
-            lastUpdateTime = currentTime
-            lastState = newState
+            synchronized(this) {
+                lastUpdateTime = currentTime
+                lastState = newState
+            }
         }
     }
 
-    private fun updateState() {
-        onRtkStatusUpdate(RtkState(
-            uncorrected = currentUncorrected,
-            corrected = currentCorrected,
-            status = status,
-            rtcmMessageCount = rtcmMessageCount
-        ))
-    }
+    // Helper data class for returning multiple values from synchronized block
+    private data class Tuple5<A, B, C, D, E>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D,
+        val fifth: E
+    )
 
     fun reset() {
-        rtcmMessageCount = 0
-        status = RtkStatus.SINGLE
-        lastUpdateTime = 0L
-        lastState = null
+        synchronized(this) {
+            rtcmMessageCount = 0
+            status = RtkStatus.SINGLE
+            lastUpdateTime = 0L
+            lastState = null
+        }
         RtkLibNative.initRtkEngine()
-        updateState()
+        // Force immediate update after reset
+        synchronized(this) {
+            onRtkStatusUpdate(RtkState(
+                uncorrected = currentUncorrected,
+                corrected = currentCorrected,
+                status = status,
+                rtcmMessageCount = rtcmMessageCount
+            ))
+        }
     }
 
     fun shutdown() {

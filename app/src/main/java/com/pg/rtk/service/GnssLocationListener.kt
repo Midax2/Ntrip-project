@@ -3,6 +3,7 @@ package com.pg.rtk.service
 import android.annotation.SuppressLint
 import android.location.GnssMeasurementsEvent
 import android.location.LocationManager
+import java.util.concurrent.Executor
 
 class GnssLocationListener(
     private val locationManager: LocationManager,
@@ -14,6 +15,10 @@ class GnssLocationListener(
         }
     }
 
+    // Executor for GNSS callback - uses calling thread for immediate processing
+    private val executor = Executor { it.run() }
+
+    @Volatile
     private var isRegistered = false
 
     /**
@@ -35,7 +40,8 @@ class GnssLocationListener(
         return try {
             // Registering the listener. Requires ACCESS_FINE_LOCATION permission.
             // Permission is validated by the caller before calling this method.
-            locationManager.registerGnssMeasurementsCallback(gnssCallback)
+            // Using newer API with executor (API 30+) to avoid deprecation warning
+            locationManager.registerGnssMeasurementsCallback(executor, gnssCallback)
             isRegistered = true
             true
         } catch (e: SecurityException) {
