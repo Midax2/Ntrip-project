@@ -25,13 +25,23 @@ class NtripClient(
         try {
             onLog("Attempting connection to ${config.host}:${config.port}...")
             socket = Socket(config.host, config.port)
-            input = socket?.getInputStream()
-            output = socket?.getOutputStream()
 
-            val authString = "${config.user}:${config.password}"
-            val encodedAuth = Base64.getEncoder().encodeToString(authString.toByteArray())
+            // Verify socket was created successfully
+            val connectedSocket = socket ?: throw Exception("Failed to create socket connection")
+
+            input = connectedSocket.getInputStream()
+            output = connectedSocket.getOutputStream()
+
+            // Verify streams were obtained successfully
+            val outputStream = output ?: throw Exception("Failed to get output stream")
+            val inputStream = input ?: throw Exception("Failed to get input stream")
 
             // 1. Send NTRIP Request
+            // Encode credentials immediately before use to minimize exposure window
+            val encodedAuth = Base64.getEncoder().encodeToString(
+                "${config.user}:${config.password}".toByteArray()
+            )
+
             val request = buildString {
                 append("GET /${config.mountPoint} HTTP/1.1\r\n")
                 append("Host: ${config.host}\r\n")
@@ -40,10 +50,10 @@ class NtripClient(
                 append("Ntrip-Version: Ntrip/2.0\r\n")
                 append("\r\n")
             }
-            output?.write(request.toByteArray())
+            outputStream.write(request.toByteArray())
 
             // 2. Read HTTP Response Header
-            val header = readHeader(input)
+            val header = readHeader(inputStream)
             onLog("Received Header: $header")
 
             if (!header.startsWith("ICY 200 OK")) {
@@ -55,7 +65,7 @@ class NtripClient(
             while (isActive) {
                 // NOTE: This simple read is NOT a proper RTCM parser.
                 // A real parser would look for the 0xD3 sync byte and message length.
-                val bytesRead = input?.read(buffer) ?: -1
+                val bytesRead = inputStream.read(buffer)
                 if (bytesRead > 0) {
                     onDataReceived(buffer.copyOf(bytesRead))
                 }
@@ -67,26 +77,32 @@ class NtripClient(
         }
     }
 
-    private fun readHeader(input: InputStream?): String {
+    private fun readHeader(input: InputStream): String {
         val header = StringBuilder()
-        var lastChar = ' '
-        var currentChar = ' '
         while (true) {
-            val byte = input?.read() ?: -1
+            val byte = input.read()
             if (byte == -1) break
-            currentChar = byte.toChar()
-            header.append(currentChar)
-            if (lastChar == '\n' && currentChar == '\n') break // End of header: \n\r\n\r or \n\n
+            header.append(byte.toChar())
+            // HTTP headers are terminated by \r\n\r\n
             if (header.endsWith("\r\n\r\n")) break
-            lastChar = currentChar
         }
         return header.toString().trim()
     }
 
     fun disconnect() {
         try {
+            // Close resources in proper order: output stream, input stream, then socket
+            output?.close()
+        } catch (e: Exception) { /* Ignore */ }
+        try {
+            input?.close()
+        } catch (e: Exception) { /* Ignore */ }
+        try {
             socket?.close()
         } catch (e: Exception) { /* Ignore */ }
+
+        output = null
+        input = null
         socket = null
         onLog("NTRIP Disconnected.")
     }

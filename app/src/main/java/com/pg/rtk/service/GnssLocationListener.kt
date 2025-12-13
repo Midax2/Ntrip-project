@@ -1,5 +1,6 @@
 package com.pg.rtk.service
 
+import android.annotation.SuppressLint
 import android.location.GnssMeasurementsEvent
 import android.location.LocationManager
 
@@ -13,18 +14,49 @@ class GnssLocationListener(
         }
     }
 
-    fun start(permissionGranted: Boolean) {
-        if (permissionGranted) {
-            try {
-                // Registering the listener. Requires ACCESS_FINE_LOCATION permission.
-                locationManager.registerGnssMeasurementsCallback(gnssCallback)
-            } catch (e: SecurityException) {
-                // Handle missing permission gracefully
-            }
+    private var isRegistered = false
+
+    /**
+     * Start GNSS measurements listener.
+     * @param permissionGranted Whether location permission has been granted
+     * @return true if listener was successfully registered, false otherwise
+     */
+    @SuppressLint("MissingPermission")
+    fun start(permissionGranted: Boolean): Boolean {
+        if (!permissionGranted) {
+            return false
+        }
+
+        // Already registered, return true
+        if (isRegistered) {
+            return true
+        }
+
+        return try {
+            // Registering the listener. Requires ACCESS_FINE_LOCATION permission.
+            // Permission is validated by the caller before calling this method.
+            locationManager.registerGnssMeasurementsCallback(gnssCallback)
+            isRegistered = true
+            true
+        } catch (e: SecurityException) {
+            // Handle missing permission gracefully
+            isRegistered = false
+            false
         }
     }
 
     fun stop() {
-        locationManager.unregisterGnssMeasurementsCallback(gnssCallback)
+        if (isRegistered) {
+            try {
+                locationManager.unregisterGnssMeasurementsCallback(gnssCallback)
+                isRegistered = false
+            } catch (e: SecurityException) {
+                // Handle case where permission was revoked or callback wasn't registered
+                isRegistered = false
+            } catch (e: IllegalArgumentException) {
+                // Handle case where callback was already unregistered
+                isRegistered = false
+            }
+        }
     }
 }

@@ -63,7 +63,14 @@ fun NtripConfigSection(
             Row(Modifier.fillMaxWidth()) {
                 OutlinedTextField(
                     value = config.port.toString(),
-                    onValueChange = { onConfigUpdate(config.copy(port = it.toIntOrNull() ?: 2101)) },
+                    onValueChange = { newValue ->
+                        // Only update if the input is a valid positive integer
+                        // Empty or invalid input preserves the current port value
+                        val newPort = newValue.toIntOrNull()
+                        if (newPort != null && newPort > 0) {
+                            onConfigUpdate(config.copy(port = newPort))
+                        }
+                    },
                     label = { Text("Port") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     enabled = !isConnected,

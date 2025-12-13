@@ -29,8 +29,9 @@ class RtkViewModel(
     private val _ntripConfig = MutableStateFlow(NtripConfig())
     val ntripConfig: StateFlow<NtripConfig> = _ntripConfig
 
-    private lateinit var ntripClient: NtripClient
+    private var ntripClient: NtripClient? = null
     private var ntripJob: Job? = null
+    private var isGnssListening = false
 
     // Initialize the GNSS Engine
     private val rtkEngine = RtkEngine { newState ->
@@ -44,13 +45,30 @@ class RtkViewModel(
 
     // Initialize the Location Listener
     @RequiresApi(Build.VERSION_CODES.O)
-    internal val gnssListener = GnssLocationListener(locationManager) { event ->
+    private val gnssListener = GnssLocationListener(locationManager) { event ->
         rtkEngine.processRawGnssData(event)
     }
 
-    init {
-        // Start listening for raw GNSS data immediately (assuming permissions are granted later)
-        gnssListener.start(permissionGranted = true)
+    /**
+     * Start GNSS location listening.
+     * Should be called only after location permissions are verified.
+     * Safe to call multiple times - will only register once.
+     */
+    fun startGnssListening(permissionGranted: Boolean) {
+        if (permissionGranted) {
+            val success = gnssListener.start(permissionGranted)
+            isGnssListening = success
+        }
+    }
+
+    /**
+     * Stop GNSS location listening.
+     */
+    fun stopGnssListening() {
+        if (isGnssListening) {
+            gnssListener.stop()
+            isGnssListening = false
+        }
     }
 
     fun updateConfig(config: NtripConfig) {
@@ -63,7 +81,7 @@ class RtkViewModel(
         _rtkState.update { it.copy(status = RtkStatus.CONNECTING_NTRIP, ntripLog = "") }
         rtkEngine.reset() // Reset engine state upon new connection attempt
 
-        ntripClient = NtripClient(
+        val client = NtripClient(
             config = _ntripConfig.value,
             onDataReceived = rtkEngine::processRtcmData, // Feed RTCM data to the engine
             onLog = { log ->
@@ -73,22 +91,39 @@ class RtkViewModel(
                 }
             }
         )
+        ntripClient = client
 
         ntripJob = viewModelScope.launch(Dispatchers.IO) {
-            ntripClient.connect()
+            client.connect()
         }
     }
 
     fun disconnectNtrip() {
         ntripJob?.cancel()
-        ntripClient.disconnect()
+        ntripClient?.disconnect()
         _rtkState.update { it.copy(status = RtkStatus.DISCONNECTED, ntripLog = "NTRIP Disconnected.") }
     }
 
     override fun onCleared() {
-        disconnectNtrip()
-        gnssListener.stop()
-        rtkEngine.shutdown()
+        // Wrap each cleanup operation to ensure all execute even if one fails
+        try {
+            disconnectNtrip()
+        } catch (e: Exception) {
+            // Log but don't propagate - continue with other cleanup
+        }
+
+        try {
+            stopGnssListening()
+        } catch (e: Exception) {
+            // Log but don't propagate - continue with other cleanup
+        }
+
+        try {
+            rtkEngine.shutdown()
+        } catch (e: Exception) {
+            // Log but don't propagate
+        }
+
         super.onCleared()
     }
 }
