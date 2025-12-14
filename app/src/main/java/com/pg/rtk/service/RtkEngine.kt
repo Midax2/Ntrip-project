@@ -43,6 +43,7 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
         val statusChanged: Boolean,
         val isFirstUpdate: Boolean,
         val positionChanged: Boolean,
+        val rtcmCountChanged: Boolean,
         val timeSinceLastUpdate: Long
     )
 
@@ -52,9 +53,20 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     private var status = RtkStatus.SINGLE
     private var lastUpdateTime = 0L
     private var lastState: RtkState? = null
+    private var isNativeInitialized = false
 
     init {
-        RtkLibNative.initRtkEngine()
+        try {
+            isNativeInitialized = RtkLibNative.initRtkEngine()
+            if (isNativeInitialized) {
+                android.util.Log.i("RtkEngine", "✓ RTK Engine initialized successfully")
+            } else {
+                android.util.Log.e("RtkEngine", "✗ RTK Engine initialization FAILED")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("RtkEngine", "✗ Exception initializing RTK Engine", e)
+            isNativeInitialized = false
+        }
     }
 
     /**
@@ -63,25 +75,27 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
      * Reference: https://github.com/google/gps-measurement-tools
      */
     private fun calculatePseudorange(measurement: GnssMeasurement, clock: android.location.GnssClock): Double {
+        val svid = measurement.svid
+
         // Check required fields
-        if (!clock.hasFullBiasNanos() || !clock.hasBiasNanos()) {
+        if (!clock.hasFullBiasNanos()) {
+            android.util.Log.w("RtkEngine", "SVID $svid: Clock missing fullBiasNanos")
             return 0.0
         }
+
+        // Note: biasNanos is optional, we handle it below
 
         // Check measurement state - need at least code lock
         val state = measurement.state
         if ((state and GnssMeasurement.STATE_CODE_LOCK) == 0) {
-            // No code lock, measurement not valid
+            android.util.Log.d("RtkEngine", "SVID $svid: No code lock (state=0x${state.toString(16)})")
             return 0.0
         }
 
         // Basic sanity check on raw received SV time (must be positive)
-        // We intentionally DO NOT enforce an upper bound here, because the
-        // interpretation of receivedSvTimeNanos as time-of-week is handled
-        // later when we combine it with the receiver's GPS week. A value
-        // near the end of the week (close to GPS_WEEK_NANOS) is still valid.
         val tTxNanos = measurement.receivedSvTimeNanos
         if (tTxNanos <= 0L) {
+            android.util.Log.w("RtkEngine", "SVID $svid: Invalid tTxNanos=$tTxNanos")
             return 0.0
         }
 
@@ -99,34 +113,27 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
         // Receiver time in GPS time scale (nanoseconds since GPS epoch: Jan 6, 1980)
         val tRxGpsNanos = tRxNanos - fullBiasNanos - biasNanos - timeOffsetNanos
 
-        // Get receiver's GPS week and time within week
-        val rxWeekNumber = tRxGpsNanos / GnssConstants.GPS_WEEK_NANOS
-        val rxTimeInWeek = tRxGpsNanos % GnssConstants.GPS_WEEK_NANOS // kept for clarity / potential future use
+        // IMPORTANT: receivedSvTimeNanos is already full GPS time (not time-of-week!)
+        // According to Android documentation, it's the received GNSS satellite time at the measurement time,
+        // already in GPS time scale (nanoseconds since GPS epoch)
+        val tTxGpsNanos = tTxNanos.toDouble()
 
-        // Satellite transmission time is time-of-week; convert to full GPS time
-        val tTxGpsNanos = rxWeekNumber * GnssConstants.GPS_WEEK_NANOS + tTxNanos
+        // Calculate travel time (receiver time - transmit time)
+        val travelTimeNanos = tRxGpsNanos - tTxGpsNanos
 
-        // Calculate time of flight
-        var travelTimeNanos = tRxGpsNanos - tTxGpsNanos
-
-        // Handle week rollover: if the computed travel time is more than half a
-        // week off, adjust by ±1 week. This allows tTxNanos values near 0 or
-        // near GPS_WEEK_NANOS to still be valid after wrapping.
-        if (travelTimeNanos > GnssConstants.GPS_WEEK_NANOS / 2) {
-            travelTimeNanos -= GnssConstants.GPS_WEEK_NANOS
-        } else if (travelTimeNanos < -GnssConstants.GPS_WEEK_NANOS / 2) {
-            travelTimeNanos += GnssConstants.GPS_WEEK_NANOS
-        }
-
-        // Convert to meters using speed of light
+        // Convert to pseudorange in meters
         val pseudorange = travelTimeNanos * GnssConstants.SPEED_OF_LIGHT_M_PER_S * 1e-9
 
-        // Sanity check: satellites at ~20,000–26,000 km
-        // Valid pseudorange: MIN_PSEUDORANGE_METERS .. MAX_PSEUDORANGE_METERS
-        if (pseudorange < GnssConstants.MIN_PSEUDORANGE_METERS ||
-            pseudorange > GnssConstants.MAX_PSEUDORANGE_METERS) {
+        // Validate pseudorange is within expected bounds
+        if (pseudorange < GnssConstants.MIN_PSEUDORANGE_METERS || pseudorange > GnssConstants.MAX_PSEUDORANGE_METERS) {
+            android.util.Log.w(
+                "RtkEngine",
+                "SVID $svid: Pseudorange $pseudorange out of bounds [${GnssConstants.MIN_PSEUDORANGE_METERS}, ${GnssConstants.MAX_PSEUDORANGE_METERS}] " +
+                        "(tRxGpsNanos=$tRxGpsNanos, tTxGpsNanos=$tTxGpsNanos, travelTimeNanos=$travelTimeNanos)"
+            )
             return 0.0
         }
+
 
         android.util.Log.d(
             "RtkEngine",
@@ -141,13 +148,34 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
                 "fullBiasNanos=${if (event.clock.hasFullBiasNanos()) event.clock.fullBiasNanos else "N/A"}, " +
                 "biasNanos=${if (event.clock.hasBiasNanos()) event.clock.biasNanos else "N/A"}")
 
+        val totalMeasurements = event.measurements.size
         val measurements = event.measurements.filter {
             it.hasCarrierFrequencyHz() &&
                     it.state and GnssMeasurement.STATE_CODE_LOCK != 0 &&
                     it.receivedSvTimeNanos != 0L
         }
 
-        if (measurements.isEmpty()) return
+        android.util.Log.d("RtkEngine", "Measurements: $totalMeasurements total, ${measurements.size} after filter")
+
+        if (!isNativeInitialized) {
+            android.util.Log.e("RtkEngine", "Cannot process measurements - native library not initialized!")
+            return
+        }
+
+        if (measurements.isEmpty()) {
+            android.util.Log.w("RtkEngine", "No measurements passed filter - need carrier freq, code lock, and valid SV time")
+            return
+        }
+
+        // Build GPS-referenced receiver time (nanoseconds since GPS epoch) to pass to native
+        if (!event.clock.hasFullBiasNanos()) {
+            android.util.Log.w("RtkEngine", "Clock missing fullBiasNanos - cannot compute GPS receiver time")
+            return
+        }
+        val clock = event.clock
+        val biasNanos = if (clock.hasBiasNanos()) clock.biasNanos else 0.0
+        val tRxGpsNanosDouble = clock.timeNanos - clock.fullBiasNanos - biasNanos
+        val tRxGpsNanos = tRxGpsNanosDouble.toLong()
 
         // Log first measurement details
         val m = measurements[0]
@@ -162,23 +190,31 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             calculatePseudorange(measurements[it], event.clock)
         }
         val carrierPhases = DoubleArray(measurements.size) {
-            // Check if carrier phase is available via state flags instead of deprecated hasCarrierPhase()
-            if (measurements[it].state and GnssMeasurement.STATE_TOW_DECODED != 0) {
-                // Carrier phase available - access directly (property not deprecated, only hasCarrierPhase() method)
-                try {
-                    measurements[it].accumulatedDeltaRangeMeters
-                } catch (_: Exception) {
-                    0.0
-                }
-            } else {
+            // Use accumulatedDeltaRangeMeters when available (returns meters)
+            try {
+                measurements[it].accumulatedDeltaRangeMeters
+            } catch (_: Exception) {
                 0.0
             }
         }
         val cn0s = DoubleArray(measurements.size) { measurements[it].cn0DbHz }
 
-        // Call native RTKLIB function
+        // Log measurement summary for debugging
+        val validPseudoranges = pseudoranges.count { it > 0.0 }
+        android.util.Log.d("RtkEngine", "Sending to native: ${measurements.size} measurements, " +
+                "$validPseudoranges valid pseudoranges")
+
+        // Log first few pseudoranges
+        if (validPseudoranges > 0) {
+            val samples = pseudoranges.take(3).filter { it > 0.0 }
+            android.util.Log.d("RtkEngine", "Sample pseudoranges: ${samples.joinToString()}")
+        } else {
+            android.util.Log.w("RtkEngine", "WARNING: No valid pseudoranges calculated!")
+        }
+
+        // Call native RTKLIB function - pass GPS-referenced receiver time
         val result = RtkLibNative.processGnssMeasurements(
-            event.clock.timeNanos,
+            tRxGpsNanos,
             svids,
             constellations,
             pseudoranges,
@@ -187,22 +223,43 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             measurements.size
         )
 
+        // Log result from native
+        android.util.Log.d("RtkEngine", "Native returned array size: ${result.size}")
+        if (result.isNotEmpty()) {
+            android.util.Log.d("RtkEngine", "Result: lat=${result[0]}, lon=${result[1]}, " +
+                    "height=${result[2]}, status=${result.getOrNull(3)}")
+        } else {
+            android.util.Log.e("RtkEngine", "ERROR: Native returned empty array!")
+        }
+
         // Result array format: [lat, lon, height, status, uncorrected_lat, uncorrected_lon, uncorrected_height]
         // If the native library doesn't provide uncorrected position (result.size < 7),
         // we'll use the corrected position as a fallback
         if (result.size >= 4) {
-            synchronized(this) {
-                currentCorrected = Coordinate(result[0], result[1], result[2])
-                updateStatusFromSolution(result[3].toInt())
+            // Check if we got actual position data or just zeros
+            if (result[0] == 0.0 && result[1] == 0.0 && result[2] == 0.0) {
+                android.util.Log.w("RtkEngine", "Native returned zeros for position - " +
+                        "positioning failed or insufficient measurements")
+                // Don't update position if it's all zeros
+            } else {
+                synchronized(this) {
+                    currentCorrected = Coordinate(result[0], result[1], result[2])
+                    updateStatusFromSolution(result[3].toInt())
 
-                // Update uncorrected position if available, otherwise use corrected as fallback
-                if (result.size >= 7) {
-                    currentUncorrected = Coordinate(result[4], result[5], result[6])
-                } else {
-                    // Use corrected position as uncorrected (single point solution)
-                    currentUncorrected = currentCorrected
+                    android.util.Log.i("RtkEngine", "Position updated: " +
+                            "${result[0]}, ${result[1]}, ${result[2]}m, status=${result[3].toInt()}")
+
+                    // Update uncorrected position if available, otherwise use corrected as fallback
+                    if (result.size >= 7) {
+                        currentUncorrected = Coordinate(result[4], result[5], result[6])
+                    } else {
+                        // Use corrected position as uncorrected (single point solution)
+                        currentUncorrected = currentCorrected
+                    }
                 }
             }
+        } else {
+            android.util.Log.e("RtkEngine", "Result array too small: ${result.size} < 4")
         }
 
         updateStateThrottled()
@@ -220,11 +277,22 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     }
 
     private fun updateStatusFromSolution(statusCode: Int) {
+        // RTKLIB status codes (from rtklib.h SOLQ_ constants):
+        // 0 = NONE (no solution)
+        // 1 = FIX (ambiguity fixed, cm-level accuracy)
+        // 2 = FLOAT (ambiguity float, dm-level accuracy)
+        // 3 = SBAS (satellite-based augmentation)
+        // 4 = DGPS (differential GPS, code-based, m-level accuracy)
+        // 5 = SINGLE (single point positioning, 5-10m accuracy)
+        // 6 = PPP (precise point positioning)
+        // 7 = DR (dead reckoning)
+
         val newStatus = when (statusCode) {
-            5 -> RtkStatus.FIX
-            4 -> RtkStatus.FLOAT
-            2 -> RtkStatus.RECEIVING_RTCM
-            else -> RtkStatus.SINGLE
+            1 -> RtkStatus.FIX       // SOLQ_FIX
+            2 -> RtkStatus.FLOAT     // SOLQ_FLOAT
+            4 -> RtkStatus.RECEIVING_RTCM  // SOLQ_DGPS (we received corrections)
+            5 -> RtkStatus.SINGLE    // SOLQ_SINGLE
+            else -> RtkStatus.SINGLE // Default to SINGLE for unknown codes
         }
 
         // Don't downgrade from RECEIVING_RTCM to SINGLE if we're actually receiving RTCM data
@@ -284,17 +352,21 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
                 calculateDistanceFast(it.corrected, state.corrected) >= MIN_POSITION_CHANGE_M
             } != false
 
+            // Check if RTCM count changed (important for showing ongoing data reception)
+            val rtcmChange = lastState?.rtcmMessageCount != state.rtcmMessageCount
+
             ThrottleCheckResult(
                 newState = state,
                 statusChanged = statusChange,
                 isFirstUpdate = firstUpdate,
                 positionChanged = posChange,
+                rtcmCountChanged = rtcmChange,
                 timeSinceLastUpdate = timeSince
             )
         }
 
-        // Update if: status changed, first update, or (enough time passed AND position changed)
-        if (checkResult.statusChanged || checkResult.isFirstUpdate ||
+        // Update if: status changed, first update, RTCM count changed, or (enough time passed AND position changed)
+        if (checkResult.statusChanged || checkResult.isFirstUpdate || checkResult.rtcmCountChanged ||
             (checkResult.timeSinceLastUpdate >= UPDATE_THROTTLE_MS && checkResult.positionChanged)) {
             onRtkStatusUpdate(checkResult.newState)
             synchronized(this) {

@@ -12,7 +12,6 @@ object GnssConstants {
      * Speed of light in vacuum (m/s).
      *
      * This should match the SPEED_OF_LIGHT constant in the native C++ code
-     * (`rtklib_jni.cpp`) to keep pseudorange calculations consistent.
      */
     const val SPEED_OF_LIGHT_M_PER_S: Double = 299_792_458.0
 

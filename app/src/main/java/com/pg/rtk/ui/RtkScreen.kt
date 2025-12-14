@@ -56,10 +56,13 @@ private const val BUTTON_DEBOUNCE_MILLIS = 1000L
 fun RtkScreen(viewModel: RtkViewModel) {
     val state by viewModel.rtkState.collectAsState()
     val config by viewModel.ntripConfig.collectAsState()
-    // Only show DISCONNECT button when actually connecting or connected to NTRIP
-    // Don't show it for SINGLE, FIX, or FLOAT (these are positioning states, not connection states)
+    // Show DISCONNECT button when NTRIP connection is active
+    // This includes: CONNECTING_NTRIP, RECEIVING_RTCM, and RTK solution states (FLOAT, FIX)
+    // Note: FLOAT and FIX indicate RTK corrections are being applied, meaning NTRIP is connected
     val isConnected = state.status == RtkStatus.CONNECTING_NTRIP ||
-                      state.status == RtkStatus.RECEIVING_RTCM
+                      state.status == RtkStatus.RECEIVING_RTCM ||
+                      state.status == RtkStatus.FLOAT ||
+                      state.status == RtkStatus.FIX
 
     Column(
         Modifier
