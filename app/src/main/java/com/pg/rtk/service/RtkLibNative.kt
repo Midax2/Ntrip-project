@@ -22,7 +22,8 @@ object RtkLibNative {
     // Process RTCM correction data
     external fun processRtcmData(data: ByteArray, length: Int): Boolean
 
-    // Get current solution status (1=SINGLE, 2=DGPS, 4=FLOAT, 5=FIX)
+    // Get current solution status
+    // RTKLIB codes: 0=NONE, 1=FIX, 2=FLOAT, 3=SBAS, 4=DGPS, 5=SINGLE, 6=PPP, 7=DR
     external fun getSolutionStatus(): Int
 
     // Cleanup
