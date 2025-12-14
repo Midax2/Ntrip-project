@@ -217,25 +217,18 @@ fun NtripConfigSection(
 
             Button(
                 onClick = {
-                    android.util.Log.d("NtripButton", "Button clicked! isConnected=$isConnected, isValidConfig=$isValidConfig")
-
                     // Debounce: prevent rapid-fire clicks
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastClickTime < BUTTON_DEBOUNCE_MILLIS) {
-                        android.util.Log.d("NtripButton", "Click ignored - too soon after last click")
                         return@Button
                     }
                     lastClickTime = currentTime
 
                     // Explicit check inside onClick to prevent accidental triggers
                     if (isConnected) {
-                        android.util.Log.d("NtripButton", "Calling onDisconnect")
                         onDisconnect()
                     } else if (isValidConfig) {
-                        android.util.Log.d("NtripButton", "Calling onConnect")
                         onConnect()
-                    } else {
-                        android.util.Log.d("NtripButton", "Click ignored - config not valid")
                     }
                 },
                 enabled = if (isConnected) {

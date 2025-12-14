@@ -170,6 +170,8 @@ class RtkViewModel(
     }
 
     // Android Location listener for fallback position (while C++ model is being improved)
+    // Permission is checked in startGnssListening() before this listener is registered
+    @android.annotation.SuppressLint("MissingPermission")
     private val locationListener = android.location.LocationListener { location ->
         _rtkState.update { current ->
             current.copy(
@@ -467,6 +469,7 @@ class RtkViewModel(
      * Update NTRIP status when data is received (thread-safe using atomic operations)
      */
     private fun updateNtripStatus(data: ByteArray) {
+        // Update atomic counters
         ntripBytesReceived.addAndGet(data.size.toLong())
 
         // Try to extract RTCM message type (simplified - RTCM messages start with D3)
@@ -478,10 +481,14 @@ class RtkViewModel(
             }
         }
 
-        // Format duration
+        // Capture all atomic values at once for consistency within this state update
         val startTime = ntripConnectionStartTime.get()
+        val currentTime = System.currentTimeMillis()
+        val bytesReceived = ntripBytesReceived.get()
+
+        // Format duration
         val duration = if (startTime > 0) {
-            val elapsedMillis = System.currentTimeMillis() - startTime
+            val elapsedMillis = currentTime - startTime
             val hours = TimeUnit.MILLISECONDS.toHours(elapsedMillis)
             val minutes = TimeUnit.MILLISECONDS.toMinutes(elapsedMillis) % 60
             val seconds = TimeUnit.MILLISECONDS.toSeconds(elapsedMillis) % 60
@@ -490,10 +497,9 @@ class RtkViewModel(
             "00:00:00"
         }
 
-        // Calculate data rate
+        // Calculate data rate using captured values
         val dataRate = if (startTime > 0) {
-            val elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000.0
-            val bytesReceived = ntripBytesReceived.get()
+            val elapsedSeconds = (currentTime - startTime) / 1000.0
             if (elapsedSeconds > 0) bytesReceived / elapsedSeconds else 0.0
         } else {
             0.0
@@ -504,12 +510,15 @@ class RtkViewModel(
             String.format("%02X", byte.toInt() and 0xFF)
         } + if (data.size > 32) " ..." else ""
 
+        // Snapshot message type counts (create immutable copy)
+        val messageTypeSnapshot = rtcmMessageTypeCount.mapValues { entry -> entry.value.get() }
+
         _ntripStatusState.update {
             it.copy(
-                bytesReceived = ntripBytesReceived.get(),
+                bytesReceived = bytesReceived,
                 connectionDuration = duration,
                 dataRate = dataRate,
-                rtcmMessageTypes = rtcmMessageTypeCount.mapValues { entry -> entry.value.get() },
+                rtcmMessageTypes = messageTypeSnapshot,
                 lastRtcmData = hexData
             )
         }

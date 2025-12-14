@@ -211,23 +211,34 @@ class NtripClient(
                                 } catch (e: NumberFormatException) {
                                     consecutiveChunkParseFailures++
 
+                                    // Calculate the start position where this "chunk size line" began
+                                    // lineEnd points to \r, offset now points past \r\n
+                                    // The chunk size line started at: offset - 2 (for \r\n) - chunkSizeLine.length
+                                    val lineStartPos = offset - 2 - chunkSizeLine.length
+
                                     // Check if this looks like raw RTCM data (starts with 0xD3 sync byte)
-                                    val firstByte = if (chunkSizeLine.isNotEmpty()) chunkSizeLine[0].code else 0
-                                    val looksLikeRtcm = firstByte == 0xD3 || buffer[offset - chunkSizeLine.length - 2].toInt() and 0xFF == 0xD3
+                                    // Only check if we have valid buffer position
+                                    val looksLikeRtcm = if (lineStartPos >= 0 && lineStartPos < bytesRead) {
+                                        buffer[lineStartPos].toInt() and 0xFF == 0xD3
+                                    } else {
+                                        false
+                                    }
 
                                     if (consecutiveChunkParseFailures >= MAX_CHUNK_PARSE_FAILURES) {
                                         // Multiple failures - switch to raw mode permanently for this connection
                                         onLog("WARNING: Chunked encoding parse failed $consecutiveChunkParseFailures times - switching to raw RTCM mode")
                                         usingRawMode = true
-                                        // Process remaining data in buffer as raw
-                                        val remainingData = buffer.copyOfRange(offset - chunkSizeLine.length - 2, bytesRead)
+                                        // Process remaining data in buffer as raw, starting from valid position
+                                        val startPos = maxOf(0, lineStartPos)
+                                        val remainingData = buffer.copyOfRange(startPos, bytesRead)
                                         onDataReceived(remainingData)
                                         rtcmBytesExtracted += remainingData.size
                                         break
                                     } else if (looksLikeRtcm) {
                                         // Looks like RTCM data - temporarily treat this buffer as raw
                                         onLog("WARNING: Chunk size parse failed (attempt $consecutiveChunkParseFailures/$MAX_CHUNK_PARSE_FAILURES), but data appears to be RTCM (sync byte 0xD3)")
-                                        val remainingData = buffer.copyOfRange(offset - chunkSizeLine.length - 2, bytesRead)
+                                        val startPos = maxOf(0, lineStartPos)
+                                        val remainingData = buffer.copyOfRange(startPos, bytesRead)
                                         onDataReceived(remainingData)
                                         rtcmBytesExtracted += remainingData.size
                                         break

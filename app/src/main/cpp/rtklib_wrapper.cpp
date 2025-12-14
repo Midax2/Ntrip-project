@@ -153,6 +153,29 @@ static int constellation2sys(int constellation) {
 }
 
 /**
+ * Get carrier wavelength (m) for L1 frequency based on satellite system
+ * Returns wavelength = speed_of_light / frequency
+ */
+static double getCarrierWavelength(int sys, int sat) {
+    (void)sat; // Reserved for future GLONASS FDMA channel-specific calculation
+    switch (sys) {
+        case SYS_GPS:
+        case SYS_GAL:
+        case SYS_QZS:
+            return CLIGHT / FREQ1;  // ~0.190 m for L1/E1
+        case SYS_GLO: {
+            // GLONASS uses FDMA - frequency depends on channel number
+            // For now, use base frequency (more accurate would require nav data)
+            return CLIGHT / FREQ1_GLO;  // ~0.187 m
+        }
+        case SYS_CMP:
+            return CLIGHT / FREQ2_CMP;  // BeiDou B1 ~0.192 m
+        default:
+            return 0.0;
+    }
+}
+
+/**
  * Convert constellation + SVID to RTKLIB satellite number
  */
 static int svid2satno(int constellation, int svid) {
@@ -200,12 +223,35 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
     jdouble* cpArray = env->GetDoubleArrayElements(carrierPhase, nullptr);
     jdouble* cn0Array = env->GetDoubleArrayElements(cn0, nullptr);
 
+    // Check if any array allocation failed
+    if (!svidArray || !constArray || !prArray || !cpArray || !cn0Array) {
+        LOGE("Failed to get JNI array elements");
+        // Release any successfully obtained arrays
+        if (svidArray) env->ReleaseIntArrayElements(svid, svidArray, JNI_ABORT);
+        if (constArray) env->ReleaseIntArrayElements(constellation, constArray, JNI_ABORT);
+        if (prArray) env->ReleaseDoubleArrayElements(pseudorange, prArray, JNI_ABORT);
+        if (cpArray) env->ReleaseDoubleArrayElements(carrierPhase, cpArray, JNI_ABORT);
+        if (cn0Array) env->ReleaseDoubleArrayElements(cn0, cn0Array, JNI_ABORT);
+        return nullptr;
+    }
+
     LOGD("Processing %d GNSS measurements", size);
 
     // Convert Android measurements to RTKLIB observation format
     gObs.n = 0;
     if (gObs.nmax < size) {
-        gObs.data = (obsd_t*)realloc(gObs.data, sizeof(obsd_t) * size);
+        auto* newData = (obsd_t*)realloc(gObs.data, sizeof(obsd_t) * size);
+        if (!newData) {
+            LOGE("Failed to allocate memory for observations (%d entries)", size);
+            // Release Java arrays before returning
+            env->ReleaseIntArrayElements(svid, svidArray, JNI_ABORT);
+            env->ReleaseIntArrayElements(constellation, constArray, JNI_ABORT);
+            env->ReleaseDoubleArrayElements(pseudorange, prArray, JNI_ABORT);
+            env->ReleaseDoubleArrayElements(carrierPhase, cpArray, JNI_ABORT);
+            env->ReleaseDoubleArrayElements(cn0, cn0Array, JNI_ABORT);
+            return nullptr;
+        }
+        gObs.data = newData;
         gObs.nmax = size;
     }
 
@@ -242,13 +288,28 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
         obs->sat = (unsigned char)satno;
         obs->rcv = 1; // Receiver 1
 
+        // Get satellite system for wavelength calculation
+        int sys = constellation2sys(constArray[i]);
+
         // L1 frequency data (index 0)
         obs->P[0] = prArray[i];                    // Pseudorange (m)
-        // RTKLIB expects carrier phase in cycles (L), but Android supplies ADR in meters.
-        // Converting meters->cycles requires carrier wavelength (depends on system/frequency).
-        // If carrier phase cycles are not provided by the Java wrapper, set to 0 to avoid
-        // feeding incorrect large values into RTKLIB.
-        obs->L[0] = 0.0;                           // Carrier phase (cycles) - unknown
+
+        // Convert carrier phase from Android ADR (Accumulated Delta Range in meters) to cycles
+        // RTKLIB expects carrier phase in cycles: L = ADR / wavelength
+        if (cpArray[i] != 0.0) {
+            double wavelength = getCarrierWavelength(sys, satno);
+            if (wavelength > 0.0) {
+                obs->L[0] = cpArray[i] / wavelength;  // Convert meters to cycles
+                LOGD("Sat %d: ADR=%.3f m, wavelength=%.4f m, L=%.3f cycles",
+                     satno, cpArray[i], wavelength, obs->L[0]);
+            } else {
+                obs->L[0] = 0.0;  // Unknown wavelength
+                LOGD("Sat %d: Unknown wavelength for system %d", satno, sys);
+            }
+        } else {
+            obs->L[0] = 0.0;  // No carrier phase data available
+        }
+
         obs->SNR[0] = (unsigned char)(cn0Array[i] * 4.0); // SNR (0.25 dB-Hz units)
         obs->LLI[0] = 0;                           // Loss of lock indicator
         obs->code[0] = CODE_L1C;                   // Code type (L1 C/A)
@@ -293,10 +354,9 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
             // decoder stores base station observations in gRtcm.obs. We need to
             // merge them with the current rover observations before calling rtkpos().
             int totalObs = gObs.n + (gRtcm.obs.n > 0 ? gRtcm.obs.n : 0);
-            obsd_t *combined = nullptr;
 
             if (totalObs > 0) {
-                combined = (obsd_t*)malloc(sizeof(obsd_t) * totalObs);
+                auto* combined = (obsd_t*)malloc(sizeof(obsd_t) * totalObs);
                 if (!combined) {
                     LOGE("Failed to allocate combined observation array (%d entries)", totalObs);
                     status = 0;
