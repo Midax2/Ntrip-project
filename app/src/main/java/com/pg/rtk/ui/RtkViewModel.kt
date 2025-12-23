@@ -29,6 +29,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import com.pg.rtk.util.GnssCapabilityChecker
+import com.pg.rtk.util.DeviceCapability
 
 class RtkViewModel(
     private val locationManager: LocationManager
@@ -193,8 +195,42 @@ class RtkViewModel(
     @android.annotation.SuppressLint("MissingPermission")
     fun startGnssListening(permissionGranted: Boolean) {
         if (permissionGranted) {
+            // Check device capability for RTK
+            val capability = GnssCapabilityChecker.checkDeviceCapability(locationManager)
+            when (capability) {
+                is DeviceCapability.FullRtkSupport -> {
+                    Log.i(TAG, "✓ Device supports raw GNSS measurements")
+                    Log.i(TAG, "Note: fullBiasNanos availability will be checked when measurements arrive")
+                }
+                is DeviceCapability.IncompleteRawGnss -> {
+                    Log.w(TAG, "⚠ Device limitation: ${capability.reason}")
+                    Log.w(TAG, "RTK positioning may not work. Recommended devices:")
+                    GnssCapabilityChecker.getRecommendedDevices().forEach { device ->
+                        Log.w(TAG, "  • $device")
+                    }
+                }
+                is DeviceCapability.NoRawGnss -> {
+                    Log.w(TAG, "⚠ Raw GNSS check: ${capability.reason}")
+                    Log.w(TAG, "Will attempt to use raw GNSS anyway - actual capability will be verified from measurements")
+                }
+                is DeviceCapability.PermissionRequired -> {
+                    Log.e(TAG, "✗ ${capability.reason}")
+                    return
+                }
+                is DeviceCapability.Unknown -> {
+                    Log.w(TAG, "? Could not determine device capability: ${capability.reason}")
+                    Log.w(TAG, "Will attempt to use raw GNSS anyway")
+                }
+            }
+
             val success = gnssListener.start(permissionGranted)
             isGnssListening = success
+
+            if (success) {
+                Log.i(TAG, "GNSS measurements listener started successfully")
+            } else {
+                Log.e(TAG, "Failed to start GNSS measurements listener")
+            }
 
             // Also start Android location updates for position display
             try {
@@ -202,6 +238,7 @@ class RtkViewModel(
                     LocationManager.GPS_PROVIDER,
                     1000L, 0f, locationListener
                 )
+                Log.i(TAG, "Standard location updates started")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start location updates", e)
             }

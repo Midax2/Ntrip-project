@@ -54,6 +54,7 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
     private var lastUpdateTime = 0L
     private var lastState: RtkState? = null
     private var isNativeInitialized = false
+    private var hasLoggedFullBiasWarning = false // Track if we've already warned about fullBiasNanos
 
     init {
         try {
@@ -83,8 +84,6 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             return 0.0
         }
 
-        // Note: biasNanos is optional, we handle it below
-
         // Check measurement state - need at least code lock
         val state = measurement.state
         if ((state and GnssMeasurement.STATE_CODE_LOCK) == 0) {
@@ -100,25 +99,21 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
         }
 
         val tRxNanos = clock.timeNanos
-
         val fullBiasNanos = clock.fullBiasNanos
-
-        // Additional bias (sub-millisecond corrections)
         val biasNanos = if (clock.hasBiasNanos()) clock.biasNanos else 0.0
-
-        // Time offset (measurement-specific)
         val timeOffsetNanos = measurement.timeOffsetNanos
-
 
         // Receiver time in GPS time scale (nanoseconds since GPS epoch: Jan 6, 1980)
         val tRxGpsNanos = tRxNanos - fullBiasNanos - biasNanos - timeOffsetNanos
 
-        // IMPORTANT: receivedSvTimeNanos is already full GPS time (not time-of-week!)
-        // According to Android documentation, it's the received GNSS satellite time at the measurement time,
-        // already in GPS time scale (nanoseconds since GPS epoch)
-        val tTxGpsNanos = tTxNanos.toDouble()
+        // Satellite transmit time calculation
+        val receivedSvTimeNanos = measurement.receivedSvTimeNanos
+
+        // Convert satellite time to GPS time scale
+        val tTxGpsNanos = receivedSvTimeNanos.toDouble() - fullBiasNanos
 
         // Calculate travel time (receiver time - transmit time)
+        // This should be positive (typically 0.06-0.08 seconds for ~20,000 km distance)
         val travelTimeNanos = tRxGpsNanos - tTxGpsNanos
 
         // Convert to pseudorange in meters
@@ -126,7 +121,33 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
         // Validate pseudorange is within expected bounds
         if (pseudorange < GnssConstants.MIN_PSEUDORANGE_METERS || pseudorange > GnssConstants.MAX_PSEUDORANGE_METERS) {
-            // Only log first occurrence or significant errors to avoid spam
+            // Log detailed information for first failed measurement
+            if (!hasLoggedFullBiasWarning) {
+                android.util.Log.e("RtkEngine", "════════════════════════════════════════════════════════")
+                android.util.Log.e("RtkEngine", "PSEUDORANGE OUT OF BOUNDS for SVID $svid")
+                android.util.Log.e("RtkEngine", "Calculated pseudorange: $pseudorange meters")
+                android.util.Log.e("RtkEngine", "Valid range: ${GnssConstants.MIN_PSEUDORANGE_METERS} to ${GnssConstants.MAX_PSEUDORANGE_METERS} meters")
+                android.util.Log.e("RtkEngine", "────────────────────────────────────────────────────────")
+                android.util.Log.e("RtkEngine", "Clock values:")
+                android.util.Log.e("RtkEngine", "  timeNanos: $tRxNanos")
+                android.util.Log.e("RtkEngine", "  fullBiasNanos: $fullBiasNanos")
+                android.util.Log.e("RtkEngine", "  biasNanos: $biasNanos")
+                android.util.Log.e("RtkEngine", "  hasFullBiasNanos: ${clock.hasFullBiasNanos()}")
+                android.util.Log.e("RtkEngine", "  hasBiasNanos: ${clock.hasBiasNanos()}")
+                android.util.Log.e("RtkEngine", "────────────────────────────────────────────────────────")
+                android.util.Log.e("RtkEngine", "Measurement values:")
+                android.util.Log.e("RtkEngine", "  receivedSvTimeNanos: $tTxNanos")
+                android.util.Log.e("RtkEngine", "  timeOffsetNanos: $timeOffsetNanos")
+                android.util.Log.e("RtkEngine", "  state: 0x${state.toString(16)}")
+                android.util.Log.e("RtkEngine", "  STATE_CODE_LOCK: ${(state and GnssMeasurement.STATE_CODE_LOCK) != 0}")
+                android.util.Log.e("RtkEngine", "────────────────────────────────────────────────────────")
+                android.util.Log.e("RtkEngine", "Calculated values:")
+                android.util.Log.e("RtkEngine", "  tRxGpsNanos: $tRxGpsNanos")
+                android.util.Log.e("RtkEngine", "  tTxGpsNanos: $tTxGpsNanos")
+                android.util.Log.e("RtkEngine", "  travelTimeNanos: $travelTimeNanos")
+                android.util.Log.e("RtkEngine", "════════════════════════════════════════════════════════")
+                hasLoggedFullBiasWarning = true
+            }
             return 0.0
         }
 
@@ -153,7 +174,21 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
 
         // Build GPS-referenced receiver time (nanoseconds since GPS epoch) to pass to native
         if (!event.clock.hasFullBiasNanos()) {
-            android.util.Log.w("RtkEngine", "Clock missing fullBiasNanos - cannot compute GPS receiver time")
+            if (!hasLoggedFullBiasWarning) {
+                android.util.Log.e("RtkEngine", "════════════════════════════════════════════════════════")
+                android.util.Log.e("RtkEngine", "CRITICAL: Clock missing fullBiasNanos")
+                android.util.Log.e("RtkEngine", "Device provides raw GNSS measurements but NOT fullBiasNanos")
+                android.util.Log.e("RtkEngine", "This is required to calculate pseudoranges for RTK positioning")
+                android.util.Log.e("RtkEngine", "════════════════════════════════════════════════════════")
+                android.util.Log.e("RtkEngine", "Your device: Can receive GNSS measurements ✓")
+                android.util.Log.e("RtkEngine", "Your device: Can provide fullBiasNanos ✗")
+                android.util.Log.e("RtkEngine", "════════════════════════════════════════════════════════")
+                android.util.Log.e("RtkEngine", "This is a hardware/firmware limitation, NOT a software bug")
+                android.util.Log.e("RtkEngine", "Compatible devices: Pixel 4+, Samsung S20+, Xiaomi Mi 8+")
+                android.util.Log.e("RtkEngine", "════════════════════════════════════════════════════════")
+                hasLoggedFullBiasWarning = true
+            }
+            // Don't return - this is a critical error but we logged it
             return
         }
         val clock = event.clock
@@ -205,21 +240,28 @@ class RtkEngine(private val onRtkStatusUpdate: (RtkState) -> Unit) {
             // Check if we got actual position data or just zeros
             if (result[0] == 0.0 && result[1] == 0.0 && result[2] == 0.0) {
                 // Don't update position if it's all zeros (positioning failed)
-                // Only log on status changes to avoid spam
+                // This prevents "blinking" where valid positions get overwritten with zeros
+                android.util.Log.w("RtkEngine", "Received zero position from native, keeping last valid position")
+                return
             } else {
                 synchronized(this) {
                     val oldStatus = status
-                    currentCorrected = Coordinate(result[0], result[1], result[2])
+                    val newCorrected = Coordinate(result[0], result[1], result[2])
+
+                    // Update status first
                     updateStatusFromSolution(result[3].toInt())
 
-                    // Only log when status changes (e.g., SINGLE -> FIX)
-                    if (oldStatus != status) {
-                        android.util.Log.i("RtkEngine", "Status changed: $oldStatus -> $status at " +
+                    // Only log when status changes (e.g., SINGLE -> FIX) or position changes significantly
+                    val posChanged = calculateDistanceFast(currentCorrected, newCorrected) > MIN_POSITION_CHANGE_M
+                    if (oldStatus != status || posChanged) {
+                        android.util.Log.i("RtkEngine", "Position update: Status=$status at " +
                                 "${result[0]}, ${result[1]}, ${result[2]}m")
                     }
 
+                    currentCorrected = newCorrected
+
                     // Update uncorrected position if available, otherwise use corrected as fallback
-                    if (result.size >= 7) {
+                    if (result.size >= 7 && !(result[4] == 0.0 && result[5] == 0.0 && result[6] == 0.0)) {
                         currentUncorrected = Coordinate(result[4], result[5], result[6])
                     } else {
                         // Use corrected position as uncorrected (single point solution)

@@ -164,6 +164,7 @@ class NtripClient(
             var remainingChunkSize = 0
             var consecutiveChunkParseFailures = 0
             var usingRawMode = false  // Track if we've switched to raw data mode
+            var firstDataBlock = true // Track first data block to check for raw RTCM
 
             while (isActive && !isDisconnecting) {
                 val bytesRead = inputStream.read(buffer)
@@ -175,6 +176,16 @@ class NtripClient(
                 if (bytesRead > 0) {
                     totalBytesRead += bytesRead
 
+                    // On first data block, check if it starts with RTCM sync byte (0xD3)
+                    // This helps detect servers that send raw RTCM without chunked encoding
+                    if (firstDataBlock) {
+                        firstDataBlock = false
+                        if ((buffer[0].toInt() and 0xFF) == 0xD3) {
+                            onLog("Detected raw RTCM data (starts with 0xD3 sync byte) - using raw mode")
+                            usingRawMode = true
+                        }
+                    }
+
                     // If we've switched to raw mode due to repeated failures, just pass through data
                     if (usingRawMode) {
                         onDataReceived(buffer.copyOf(bytesRead))
@@ -182,7 +193,7 @@ class NtripClient(
                     } else {
                         // Process chunked transfer encoding
                         var offset = 0
-                        while (offset < bytesRead && !usingRawMode) {
+                        while (offset < bytesRead) {
                             if (readingChunkSize) {
                                 // Read chunk size line (hex number followed by \r\n)
                                 val lineEnd = findLineEnd(buffer, offset, bytesRead)

@@ -11,6 +11,7 @@ extern "C" {
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
 // Global RTKLIB structures
 static rtcm_t gRtcm = {0};
@@ -330,22 +331,39 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
     // Prepare result array
     double result[7] = {0};
 
+    // Calculate uncorrected (single point) position first
+    sol_t singleSol = {0};
     if (validCount >= 4) {
-        // Perform positioning
+        char msg[128] = {0};
+        double azel[MAXSAT * 2] = {0};
+        ssat_t ssat[MAXSAT] = {0};
+
+        int singleStatus = pntpos(gObs.data, gObs.n, &gNav, &gPrcOpt, &singleSol, azel, ssat, msg);
+
+        if (singleStatus && singleSol.stat > 0) {
+            // Store uncorrected position
+            double uncorrPos[3];
+            ecef2pos(singleSol.rr, uncorrPos);
+            result[4] = uncorrPos[0] * R2D;  // Uncorrected Latitude (degrees)
+            result[5] = uncorrPos[1] * R2D;  // Uncorrected Longitude (degrees)
+            result[6] = uncorrPos[2];         // Uncorrected Height (m)
+            LOGI("Uncorrected (Single) Position: %.8f° N, %.8f° E, %.2f m, Satellites=%d",
+                 result[4], result[5], result[6], singleSol.ns);
+        } else {
+            LOGD("Single point positioning failed: %s", msg);
+        }
+    }
+
+    if (validCount >= 4) {
+        // Perform positioning for corrected solution
         int status;
 
         if (gPrcOpt.mode == PMODE_SINGLE || gRtcm.obs.n == 0) {
-            // Single point positioning
-            char msg[128] = {0};
-            double azel[MAXSAT * 2] = {0};
-            ssat_t ssat[MAXSAT] = {0};
-
-            status = pntpos(gObs.data, gObs.n, &gNav, &gPrcOpt, &gSol, azel, ssat, msg);
-
+            // Use single point solution as corrected position (no RTCM corrections)
+            gSol = singleSol;
+            status = (gSol.stat > 0) ? 1 : 0;
             if (status) {
-                LOGI("Single point solution: status=%d, ns=%d", gSol.stat, gSol.ns);
-            } else {
-                LOGE("Single point positioning failed: %s", msg);
+                LOGI("Single point solution (no RTCM): status=%d, ns=%d", gSol.stat, gSol.ns);
             }
         } else {
             // RTK positioning with base station corrections
@@ -353,42 +371,56 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
             // base/reference observations (rcv==2) in a single array. The RTCM
             // decoder stores base station observations in gRtcm.obs. We need to
             // merge them with the current rover observations before calling rtkpos().
-            int totalObs = gObs.n + (gRtcm.obs.n > 0 ? gRtcm.obs.n : 0);
 
-            if (totalObs > 0) {
-                auto* combined = (obsd_t*)malloc(sizeof(obsd_t) * totalObs);
-                if (!combined) {
-                    LOGE("Failed to allocate combined observation array (%d entries)", totalObs);
-                    status = 0;
+            // Check if base observations are recent enough (within 30 seconds)
+            double timeDiff = timediff(obsTime, gRtcm.obs.data[0].time);
+            if (fabs(timeDiff) > gPrcOpt.maxtdiff) {
+                LOGW("Base observations too old (%.1f sec difference), using single point solution", timeDiff);
+                gSol = singleSol;
+                status = (gSol.stat > 0) ? 1 : 0;
+            } else {
+                int totalObs = gObs.n + (gRtcm.obs.n > 0 ? gRtcm.obs.n : 0);
+
+                if (totalObs > 0) {
+                    auto* combined = (obsd_t*)malloc(sizeof(obsd_t) * totalObs);
+                    if (!combined) {
+                        LOGE("Failed to allocate combined observation array (%d entries)", totalObs);
+                        status = 0;
+                    } else {
+                        // Copy rover observations (rcv = 1)
+                        for (int i = 0; i < gObs.n; i++) {
+                            combined[i] = gObs.data[i];
+                            combined[i].rcv = 1;
+                        }
+
+                        // Append base/reference observations from rtcm (rcv = 2)
+                        for (int j = 0; j < gRtcm.obs.n; j++) {
+                            combined[gObs.n + j] = gRtcm.obs.data[j];
+                            combined[gObs.n + j].rcv = 2;
+                        }
+
+                        LOGI("RTK processing: rover obs=%d, base obs=%d, time diff=%.1f sec",
+                             gObs.n, gRtcm.obs.n, timeDiff);
+
+                        // Note: rtkpos expects observations sorted by receiver (rover then base)
+                        status = rtkpos(&gRtk, combined, totalObs, &gNav);
+
+                        free(combined);
+                    }
                 } else {
-                    // Copy rover observations (rcv = 1)
-                    for (int i = 0; i < gObs.n; i++) {
-                        combined[i] = gObs.data[i];
-                        combined[i].rcv = 1;
-                    }
-
-                    // Append base/reference observations from rtcm (rcv = 2)
-                    for (int j = 0; j < gRtcm.obs.n; j++) {
-                        combined[gObs.n + j] = gRtcm.obs.data[j];
-                        combined[gObs.n + j].rcv = 2;
-                    }
-
-                    // Note: rtkpos expects observations sorted by receiver (rover then base)
-                    status = rtkpos(&gRtk, combined, totalObs, &gNav);
-
-                    free(combined);
+                    LOGE("No observations available for RTK positioning");
+                    status = 0;
                 }
-            } else {
-                LOGE("No observations available for RTK positioning");
-                status = 0;
-            }
 
-            if (status) {
-                gSol = gRtk.sol;
-                LOGI("RTK solution: status=%d (1=FIX,2=FLOAT,4=DGPS,5=SINGLE), ns=%d, ratio=%.2f",
-                     gSol.stat, gSol.ns, gSol.ratio);
-            } else {
-                LOGE("RTK positioning failed");
+                if (status) {
+                    gSol = gRtk.sol;
+                    LOGI("RTK solution: status=%d (1=FIX,2=FLOAT,4=DGPS,5=SINGLE), ns=%d, ratio=%.2f",
+                         gSol.stat, gSol.ns, gSol.ratio);
+                } else {
+                    LOGE("RTK positioning failed, falling back to single point solution");
+                    gSol = singleSol;
+                    status = (gSol.stat > 0) ? 1 : 0;
+                }
             }
         }
 
@@ -402,20 +434,24 @@ Java_com_pg_rtk_service_RtkLibNative_processGnssMeasurements(
             result[2] = pos[2];         // Height (m)
             result[3] = (double)gSol.stat; // Solution status
 
-            // Return same position for uncorrected (for now)
-            result[4] = result[0];
-            result[5] = result[1];
-            result[6] = result[2];
+            // If uncorrected position wasn't calculated (no single solution), use corrected as fallback
+            if (result[4] == 0.0 && result[5] == 0.0 && result[6] == 0.0) {
+                result[4] = result[0];
+                result[5] = result[1];
+                result[6] = result[2];
+            }
 
             LOGI("Position: %.8f° N, %.8f° E, %.2f m, Status=%d, Satellites=%d",
                  result[0], result[1], result[2], (int)result[3], gSol.ns);
         } else {
             LOGE("Positioning failed or invalid solution");
             result[3] = 0; // Invalid status
+            // Keep uncorrected position if it was calculated
         }
     } else {
         LOGE("Insufficient valid measurements: %d < 4", validCount);
         result[3] = 0;
+        // Keep uncorrected position if it was calculated
     }
 
     // Create return array
@@ -457,9 +493,62 @@ Java_com_pg_rtk_service_RtkLibNative_processRtcmData(
 
             // Copy ephemeris data to navigation structure
             if (gRtcm.ephsat > 0) {
-                // Ephemeris updated - copy nav structure shallowly to make data available
-                gNav = gRtcm.nav;
-                LOGI("Ephemeris updated for satellite %d", gRtcm.ephsat);
+                // Ephemeris updated - copy specific satellite ephemeris
+                int sat = gRtcm.ephsat;
+                if (satsys(sat, NULL) == SYS_GPS || satsys(sat, NULL) == SYS_GAL ||
+                    satsys(sat, NULL) == SYS_QZS || satsys(sat, NULL) == SYS_CMP) {
+                    // Allocate ephemeris array if needed
+                    if (gNav.n >= gNav.nmax) {
+                        gNav.nmax = gNav.nmax <= 0 ? 256 : gNav.nmax * 2;
+                        auto* newEph = (eph_t*)realloc(gNav.eph, sizeof(eph_t) * gNav.nmax);
+                        if (newEph) {
+                            gNav.eph = newEph;
+                        } else {
+                            LOGE("Failed to allocate memory for ephemeris");
+                        }
+                    }
+                    // Copy the new ephemeris
+                    if (gNav.eph && gRtcm.nav.eph) {
+                        // Find and update existing ephemeris for this satellite
+                        int idx = -1;
+                        for (int k = 0; k < gNav.n; k++) {
+                            if (gNav.eph[k].sat == sat) {
+                                idx = k;
+                                break;
+                            }
+                        }
+                        if (idx >= 0) {
+                            gNav.eph[idx] = gRtcm.nav.eph[0];  // Update existing
+                        } else if (gNav.n < gNav.nmax) {
+                            gNav.eph[gNav.n++] = gRtcm.nav.eph[0];  // Add new
+                        }
+                        LOGI("Ephemeris updated for satellite %d (total: %d)", sat, gNav.n);
+                    }
+                } else if (satsys(sat, NULL) == SYS_GLO) {
+                    // GLONASS ephemeris
+                    if (gNav.ng >= gNav.ngmax) {
+                        gNav.ngmax = gNav.ngmax <= 0 ? 256 : gNav.ngmax * 2;
+                        auto* newGeph = (geph_t*)realloc(gNav.geph, sizeof(geph_t) * gNav.ngmax);
+                        if (newGeph) {
+                            gNav.geph = newGeph;
+                        }
+                    }
+                    if (gNav.geph && gRtcm.nav.geph) {
+                        int idx = -1;
+                        for (int k = 0; k < gNav.ng; k++) {
+                            if (gNav.geph[k].sat == sat) {
+                                idx = k;
+                                break;
+                            }
+                        }
+                        if (idx >= 0) {
+                            gNav.geph[idx] = gRtcm.nav.geph[0];
+                        } else if (gNav.ng < gNav.ngmax) {
+                            gNav.geph[gNav.ng++] = gRtcm.nav.geph[0];
+                        }
+                        LOGI("GLONASS ephemeris updated for satellite %d", sat);
+                    }
+                }
             }
 
             // Copy observation data for differential corrections
